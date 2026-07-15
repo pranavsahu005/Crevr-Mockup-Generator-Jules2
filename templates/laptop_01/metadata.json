@@ -1,0 +1,59 @@
+{
+    "id": "laptop_01",
+    "category": "tech",
+    "subtype": "laptop",
+    "label": "Modern Laptop \u2014 Front Angled",
+    "base_image": "base.png",
+    "mask_image": "mask.png",
+    "displacement_image": "displacement.png",
+    "lighting_image": "lighting.png",
+    "design_zone_corners": [
+        [
+            405,
+            938
+        ],
+        [
+            2643,
+            733
+        ],
+        [
+            2878,
+            2278
+        ],
+        [
+            623,
+            2567
+        ]
+    ],
+    "fold_intensity": 0.0,
+    "allow_rotation": true,
+    "rotation_limits_deg": [
+        -10,
+        10
+    ],
+    "allow_perspective_adjust": true,
+    "recommended_design_resolution_px": [
+        2500,
+        1600
+    ],
+    "min_upload_resolution_px": [
+        500,
+        500
+    ],
+    "max_upload_resolution_px": [
+        8000,
+        8000
+    ],
+    "supported_formats": [
+        "png",
+        "jpg",
+        "webp"
+    ],
+    "export_default_format": "png",
+    "export_max_resolution_px": [
+        4096,
+        4096
+    ],
+    "created_at": "2026-07-15",
+    "engine_version": "1.0"
+}

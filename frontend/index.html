@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crevr Mockup Generator — Professional Compositing Suite</title>
+    <!-- Tailwind CSS (No frosted glass/gradients, clean white high-contrast) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & Babel -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Fabric.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.1/fabric.min.js"></script>
+    <!-- Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #fbfbfb;
+            color: #111111;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 antialiased">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        function App() {
+            const [templates, setTemplates] = useState([]);
+            const [selectedTemplate, setSelectedTemplate] = useState(null);
+            const [activeCategory, setActiveCategory] = useState("all");
+            const [designImage, setDesignImage] = useState(null);
+            const [isRendering, setIsRendering] = useState(false);
+            const [renderedOutput, setRenderedOutput] = useState(null);
+            const [history, setHistory] = useState([]);
+
+            // Render request properties
+            const [scale, setScale] = useState(0.4);
+            const [rotation, setRotation] = useState(0);
+            const [offsetX, setOffsetX] = useState(0);
+            const [offsetY, setOffsetY] = useState(0);
+            const [blendMode, setBlendMode] = useState("multiply");
+            const [colorCorrect, setColorCorrect] = useState(true);
+            const [featherRadius, setFeatherRadius] = useState(5);
+            const [foldIntensity, setFoldIntensity] = useState(15);
+
+            // Export properties
+            const [exportFormat, setExportFormat] = useState("png");
+            const [dpi, setDpi] = useState(300);
+            const [physicalWidth, setPhysicalWidth] = useState(100);
+            const [physicalHeight, setPhysicalHeight] = useState(100);
+            const [usePhysicalDims, setUsePhysicalDims] = useState(false);
+
+            // Keeps track of the scaling factor of the base image on the canvas
+            const [fitScale, setFitScale] = useState(1.0);
+
+            const canvasRef = useRef(null);
+            const fabricCanvas = useRef(null);
+
+            // Fetch templates & history on mount
+            useEffect(() => {
+                fetch("/api/templates")
+                    .then(res => res.json())
+                    .then(data => {
+                        setTemplates(data);
+                        if (data.length > 0) {
+                            selectTemplate(data[0]);
+                        }
+                    });
+                fetchHistory();
+            }, []);
+
+            const fetchHistory = () => {
+                fetch("/api/history")
+                    .then(res => res.json())
+                    .then(data => setHistory(data));
+            };
+
+            const selectTemplate = (tpl) => {
+                setSelectedTemplate(tpl);
+                setFoldIntensity(tpl.fold_intensity || 15);
+                setRenderedOutput(null);
+
+                // Initialize fabric canvas with the template's base photo
+                setTimeout(() => {
+                    initFabricCanvas(tpl);
+                }, 100);
+            };
+
+            const initFabricCanvas = (tpl) => {
+                if (fabricCanvas.current) {
+                    fabricCanvas.current.dispose();
+                }
+
+                const container = document.getElementById("canvas-container");
+                if (!container) return;
+
+                const width = container.clientWidth;
+                const height = 500;
+
+                const canvas = new fabric.Canvas("fabric-canvas", {
+                    width: width,
+                    height: height,
+                    backgroundColor: "#ffffff",
+                    preserveObjectStacking: true
+                });
+
+                fabricCanvas.current = canvas;
+
+                // Load base template image as background or back layer
+                const baseImgUrl = `/templates/${tpl.id}/${tpl.base_image}`;
+                fabric.Image.fromURL(baseImgUrl, (oImg) => {
+                    oImg.set({
+                        selectable: false,
+                        evented: false,
+                        originX: "left",
+                        originY: "top"
+                    });
+
+                    // Scale base image to fit canvas while maintaining aspect ratio
+                    const scaleX = width / oImg.width;
+                    const scaleY = height / oImg.height;
+                    const currentFitScale = Math.min(scaleX, scaleY);
+                    setFitScale(currentFitScale);
+
+                    oImg.scale(currentFitScale);
+                    canvas.setWidth(oImg.width * currentFitScale);
+                    canvas.setHeight(oImg.height * currentFitScale);
+                    canvas.add(oImg);
+                    canvas.sendToBack(oImg);
+
+                    // Add design placement box (visual guide for the design zone)
+                    const corners = tpl.design_zone_corners;
+                    if (corners && corners.length === 4) {
+                        const xs = corners.map(c => c[0]);
+                        const ys = corners.map(c => c[1]);
+                        const minX = Math.min(...xs);
+                        const maxX = Math.max(...xs);
+                        const minY = Math.min(...ys);
+                        const maxY = Math.max(...ys);
+
+                        const rect = new fabric.Rect({
+                            left: minX * currentFitScale,
+                            top: minY * currentFitScale,
+                            width: (maxX - minX) * currentFitScale,
+                            height: (maxY - minY) * currentFitScale,
+                            fill: "rgba(33, 150, 243, 0.08)",
+                            stroke: "#2196F3",
+                            strokeWidth: 2,
+                            strokeDashArray: [5, 5],
+                            selectable: false,
+                            evented: false
+                        });
+                        canvas.add(rect);
+                    }
+
+                    canvas.renderAll();
+                });
+
+                // Set up event listeners for moving objects
+                canvas.on("object:moving", updateTransformParams);
+                canvas.on("object:scaling", updateTransformParams);
+                canvas.on("object:rotating", updateTransformParams);
+            };
+
+            const updateTransformParams = (e) => {
+                const activeObj = e.target;
+                if (!activeObj || !selectedTemplate) return;
+
+                const canvasW = fabricCanvas.current.width;
+                setScale(activeObj.scaleX);
+                setRotation(activeObj.angle);
+                setOffsetX(Math.round(activeObj.left - canvasW / 2));
+                setOffsetY(Math.round(activeObj.top - 250));
+            };
+
+            const handleDesignUpload = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    const b64Data = event.target.result;
+                    setDesignImage(b64Data);
+
+                    // Add to Fabric canvas
+                    fabric.Image.fromURL(b64Data, (img) => {
+                        const objects = fabricCanvas.current.getObjects();
+                        objects.forEach(obj => {
+                            if (obj.id === "user-design") {
+                                fabricCanvas.current.remove(obj);
+                            }
+                        });
+
+                        img.set({
+                            id: "user-design",
+                            left: fabricCanvas.current.width / 2,
+                            top: fabricCanvas.current.height / 2,
+                            originX: "center",
+                            originY: "center"
+                        });
+                        img.scaleToWidth(fabricCanvas.current.width * 0.35);
+
+                        fabricCanvas.current.add(img);
+                        fabricCanvas.current.setActiveObject(img);
+                        fabricCanvas.current.renderAll();
+
+                        setScale(img.scaleX);
+                        setRotation(img.angle);
+                    });
+                };
+                reader.readAsDataURL(file);
+            };
+
+            const triggerRenderPipeline = () => {
+                if (!selectedTemplate || !designImage) {
+                    alert("Please upload a custom design logo first.");
+                    return;
+                }
+
+                setIsRendering(true);
+
+                // Compute exact high-res coordinates of the design layer's four corners
+                let highResDstCorners = null;
+                const activeObj = fabricCanvas.current.getObjects().find(obj => obj.id === "user-design");
+                if (activeObj) {
+                    // getCoords() returns [tl, tr, br, bl] in canvas coordinates
+                    const coords = activeObj.getCoords();
+                    highResDstCorners = coords.map(pt => [pt.x / fitScale, pt.y / fitScale]);
+                }
+
+                const body = {
+                    template_id: selectedTemplate.id,
+                    design_base64: designImage,
+                    dst_corners: highResDstCorners,
+                    blend_mode: blendMode,
+                    color_correct: colorCorrect,
+                    feather_radius: featherRadius,
+                    fold_intensity: foldIntensity,
+                    export_format: exportFormat,
+                    dpi: dpi,
+                    physical_size_mm: usePhysicalDims ? [physicalWidth, physicalHeight] : null
+                };
+
+                fetch("/api/render", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify(body)
+                })
+                .then(res => {
+                    if (!res.ok) {
+                        return res.json().then(err => { throw new Error(err.detail || "Failed to render") });
+                    }
+                    return res.json();
+                })
+                .then(data => {
+                    setRenderedOutput(data.mockup_base64);
+                    setIsRendering(false);
+                    fetchHistory();
+                })
+                .catch(err => {
+                    alert("Error processing pipeline: " + err.message);
+                    setIsRendering(false);
+                });
+            };
+
+            const downloadMockup = () => {
+                if (!renderedOutput) return;
+                const link = document.createElement("a");
+                link.href = renderedOutput;
+                link.download = `crevr-mockup-${selectedTemplate.id}.${exportFormat}`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            };
+
+            const categories = ["all", "apparel", "tech", "print"];
+
+            return (
+                <div className="min-h-screen flex flex-col bg-white">
+                    {/* Header */}
+                    <header className="bg-white border-b border-gray-200 px-6 py-4 flex justify-between items-center">
+                        <div className="flex items-center gap-3">
+                            <span className="font-semibold text-xl tracking-tight text-gray-900">Crevr Mockup Generator</span>
+                            <span className="bg-blue-100 text-blue-800 text-xs font-medium px-2.5 py-0.5 rounded">Deterministic CV Engine</span>
+                        </div>
+                        <div className="flex items-center gap-6">
+                            <a href="#history" className="text-sm font-medium text-gray-600 hover:text-gray-900">History</a>
+                            <span className="text-gray-300">|</span>
+                            <div className="text-sm font-semibold text-gray-700">Production Mode</div>
+                        </div>
+                    </header>
+
+                    {/* Main Workspace */}
+                    <div className="flex-1 flex overflow-hidden">
+
+                        {/* Sidebar Left: Template Selection */}
+                        <aside className="w-80 border-r border-gray-200 bg-white p-6 overflow-y-auto flex flex-col gap-6">
+                            <div>
+                                <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">1. Select Template</h2>
+                                <div className="flex gap-1 bg-gray-100 p-1 rounded-lg mb-4">
+                                    {categories.map(cat => (
+                                        <button
+                                            key={cat}
+                                            onClick={() => setActiveCategory(cat)}
+                                            className={`flex-1 py-1.5 text-xs font-medium rounded-md capitalize transition-colors ${
+                                                activeCategory === cat ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-900"
+                                            }`}
+                                        >
+                                            {cat}
+                                        </button>
+                                    ))}
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-3">
+                                    {templates
+                                        .filter(t => activeCategory === "all" || t.category === activeCategory)
+                                        .map(tpl => (
+                                            <button
+                                                key={tpl.id}
+                                                onClick={() => selectTemplate(tpl)}
+                                                className={`group relative text-left border rounded-lg overflow-hidden transition-all ${
+                                                    selectedTemplate?.id === tpl.id
+                                                        ? "border-blue-500 ring-2 ring-blue-100"
+                                                        : "border-gray-200 hover:border-gray-300"
+                                                }`}
+                                            >
+                                                <div className="aspect-square bg-gray-50 flex items-center justify-center overflow-hidden">
+                                                    <img
+                                                        src={`/templates/${tpl.id}/${tpl.base_image}`}
+                                                        alt={tpl.label}
+                                                        className="object-cover w-full h-full group-hover:scale-105 transition-transform duration-200"
+                                                    />
+                                                </div>
+                                                <div className="p-2 border-t border-gray-100 bg-white">
+                                                    <p className="text-xs font-medium text-gray-900 truncate">{tpl.label}</p>
+                                                    <p className="text-[10px] text-gray-400 capitalize">{tpl.category}</p>
+                                                </div>
+                                            </button>
+                                        ))}
+                                </div>
+                            </div>
+
+                            {/* Design File Upload */}
+                            <div className="border-t border-gray-100 pt-6">
+                                <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">2. Upload Custom Artwork</h2>
+                                <div className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-blue-500 transition-colors bg-slate-50 cursor-pointer relative">
+                                    <input
+                                        type="file"
+                                        accept="image/*"
+                                        onChange={handleDesignUpload}
+                                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                                    />
+                                    <svg className="mx-auto h-12 w-12 text-gray-400" stroke="currentColor" fill="none" viewBox="0 0 48 48">
+                                        <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                    </svg>
+                                    <p className="mt-2 text-xs font-medium text-gray-700">PNG, JPG, or WebP</p>
+                                    <p className="mt-1 text-[10px] text-gray-400">Click or drag & drop</p>
+                                </div>
+                                {designImage && (
+                                    <div className="mt-4 p-2 bg-gray-50 border border-gray-200 rounded-lg flex items-center gap-3">
+                                        <div className="w-12 h-12 bg-white border border-gray-100 rounded overflow-hidden flex items-center justify-center">
+                                            <img src={designImage} alt="Uploaded logo" className="object-contain max-w-full max-h-full" />
+                                        </div>
+                                        <div className="flex-1 min-w-0">
+                                            <p className="text-xs font-semibold text-gray-900 truncate">Design File Loaded</p>
+                                            <p className="text-[10px] text-gray-400">Active on Canvas</p>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </aside>
+
+                        {/* Middle Area: Interactive Canvas & Previews */}
+                        <main className="flex-1 bg-slate-50 p-8 flex flex-col gap-6 overflow-y-auto">
+
+                            <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
+                                <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center bg-white">
+                                    <h3 className="font-semibold text-sm text-gray-900">Interactive Setup</h3>
+                                    <span className="text-xs text-gray-400">Reposition, scale or rotate design inside boundaries</span>
+                                </div>
+                                <div id="canvas-container" className="p-6 flex justify-center bg-gray-50">
+                                    <canvas id="fabric-canvas"></canvas>
+                                </div>
+                            </div>
+
+                            {/* Server Render Output Preview */}
+                            <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
+                                <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center">
+                                    <h3 className="font-semibold text-sm text-gray-900">High-Fidelity Render Output</h3>
+                                    {renderedOutput && (
+                                        <button
+                                            onClick={downloadMockup}
+                                            className="px-4 py-1.5 bg-green-600 hover:bg-green-700 text-white text-xs font-semibold rounded-lg shadow-sm transition-colors"
+                                        >
+                                            Download Final Image
+                                        </button>
+                                    )}
+                                </div>
+                                <div className="p-6 flex justify-center bg-slate-100 min-h-[300px] items-center relative">
+                                    {isRendering ? (
+                                        <div className="text-center">
+                                            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-3"></div>
+                                            <p className="text-xs font-medium text-gray-600">Executing OpenCV compositing, displacement mappings & blends...</p>
+                                        </div>
+                                    ) : renderedOutput ? (
+                                        <img src={renderedOutput} alt="Mockup Output" className="max-h-[500px] object-contain border border-gray-200 shadow-lg bg-white rounded-lg" />
+                                    ) : (
+                                        <div className="text-center text-gray-400 p-8">
+                                            <svg className="mx-auto h-12 w-12 text-gray-300 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                            </svg>
+                                            <p className="text-xs font-medium">Click "Preview (Full Render)" inside properties sidebar to trigger rendering.</p>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </main>
+
+                        {/* Sidebar Right: Render Parameters & Export Settings */}
+                        <aside className="w-80 border-l border-gray-200 bg-white p-6 overflow-y-auto flex flex-col gap-6">
+
+                            {/* Render Settings */}
+                            <div>
+                                <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">3. Render Settings</h2>
+                                <div className="flex flex-col gap-4">
+
+                                    {/* Fold Intensity (Displacement Scale) */}
+                                    <div>
+                                        <div className="flex justify-between mb-1">
+                                            <label className="text-xs font-medium text-gray-700">Fold Intensity (Displacement)</label>
+                                            <span className="text-xs font-semibold text-gray-500">{foldIntensity}px</span>
+                                        </div>
+                                        <input
+                                            type="range"
+                                            min="0"
+                                            max="50"
+                                            value={foldIntensity}
+                                            onChange={(e) => setFoldIntensity(parseFloat(e.target.value))}
+                                            className="w-full accent-blue-600 h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                                        />
+                                    </div>
+
+                                    {/* Edge Feathering */}
+                                    <div>
+                                        <div className="flex justify-between mb-1">
+                                            <label className="text-xs font-medium text-gray-700">Edge Feathering Radius</label>
+                                            <span className="text-xs font-semibold text-gray-500">{featherRadius}px</span>
+                                        </div>
+                                        <input
+                                            type="range"
+                                            min="0"
+                                            max="15"
+                                            value={featherRadius}
+                                            onChange={(e) => setFeatherRadius(parseInt(e.target.value))}
+                                            className="w-full accent-blue-600 h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                                        />
+                                    </div>
+
+                                    {/* Photometric Blending Mode */}
+                                    <div>
+                                        <label className="block text-xs font-medium text-gray-700 mb-1">Photometric Blend Mode</label>
+                                        <select
+                                            value={blendMode}
+                                            onChange={(e) => setBlendMode(e.target.value)}
+                                            className="w-full text-xs bg-gray-50 border border-gray-200 rounded-lg p-2 focus:border-blue-500 focus:outline-none"
+                                        >
+                                            <option value="multiply">Multiply (Perfect for Shadows)</option>
+                                            <option value="overlay">Overlay (Balanced Highlights)</option>
+                                            <option value="linear_burn">Linear Burn (Deep Wrinkles)</option>
+                                        </select>
+                                    </div>
+
+                                    {/* Color Correction Toggle */}
+                                    <div className="flex items-center justify-between p-2 bg-gray-50 border border-gray-200 rounded-lg">
+                                        <div>
+                                            <label className="text-xs font-semibold text-gray-700">LAB Histogram Match</label>
+                                            <p className="text-[10px] text-gray-400">Match ambient colors</p>
+                                        </div>
+                                        <input
+                                            type="checkbox"
+                                            checked={colorCorrect}
+                                            onChange={(e) => setColorCorrect(e.target.checked)}
+                                            className="w-4 h-4 text-blue-600 accent-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500 focus:ring-2"
+                                        />
+                                    </div>
+
+                                    {/* Generate/Render Button */}
+                                    <button
+                                        onClick={triggerRenderPipeline}
+                                        disabled={isRendering || !designImage}
+                                        className={`w-full py-2.5 text-xs font-semibold rounded-lg shadow transition-colors flex items-center justify-center gap-2 ${
+                                            designImage
+                                                ? "bg-blue-600 hover:bg-blue-700 text-white"
+                                                : "bg-gray-100 text-gray-400 cursor-not-allowed"
+                                        }`}
+                                    >
+                                        {isRendering ? "Processing..." : "Preview (Full Render)"}
+                                    </button>
+
+                                </div>
+                            </div>
+
+                            {/* High-Resolution Export Panel */}
+                            <div className="border-t border-gray-100 pt-6">
+                                <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">4. Export Options</h2>
+                                <div className="flex flex-col gap-4">
+
+                                    {/* Export Format */}
+                                    <div className="grid grid-cols-3 gap-1 bg-gray-100 p-1 rounded-lg">
+                                        {["png", "jpg", "webp"].map(fmt => (
+                                            <button
+                                                key={fmt}
+                                                onClick={() => setExportFormat(fmt)}
+                                                className={`py-1 text-xs font-semibold rounded capitalize ${
+                                                    exportFormat === fmt ? "bg-white text-gray-900 shadow-sm" : "text-gray-500"
+                                                }`}
+                                            >
+                                                {fmt}
+                                            </button>
+                                        ))}
+                                    </div>
+
+                                    {/* Enable Print Dpi override */}
+                                    <div className="flex items-center justify-between">
+                                        <span className="text-xs font-medium text-gray-700">Print DPI Rescaling</span>
+                                        <input
+                                            type="checkbox"
+                                            checked={usePhysicalDims}
+                                            onChange={(e) => setUsePhysicalDims(e.target.checked)}
+                                            className="accent-blue-600"
+                                        />
+                                    </div>
+
+                                    {usePhysicalDims && (
+                                        <div className="flex flex-col gap-3 p-3 bg-gray-50 border border-gray-100 rounded-lg">
+                                            <div className="flex gap-2">
+                                                <div className="flex-1">
+                                                    <label className="block text-[10px] text-gray-500 mb-0.5">Width (mm)</label>
+                                                    <input
+                                                        type="number"
+                                                        value={physicalWidth}
+                                                        onChange={(e) => setPhysicalWidth(parseFloat(e.target.value))}
+                                                        className="w-full text-xs p-1.5 border border-gray-200 rounded"
+                                                    />
+                                                </div>
+                                                <div className="flex-1">
+                                                    <label className="block text-[10px] text-gray-500 mb-0.5">Height (mm)</label>
+                                                    <input
+                                                        type="number"
+                                                        value={physicalHeight}
+                                                        onChange={(e) => setPhysicalHeight(parseFloat(e.target.value))}
+                                                        className="w-full text-xs p-1.5 border border-gray-200 rounded"
+                                                    />
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-[10px] text-gray-500 mb-0.5">DPI</label>
+                                                <select
+                                                    value={dpi}
+                                                    onChange={(e) => setDpi(parseInt(e.target.value))}
+                                                    className="w-full text-xs p-1.5 border border-gray-200 rounded"
+                                                >
+                                                    <option value={72}>72 DPI (Web Preview)</option>
+                                                    <option value={150}>150 DPI (Standard)</option>
+                                                    <option value={300}>300 DPI (High-Quality Print)</option>
+                                                    <option value={600}>600 DPI (Ultra Premium Print)</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                </div>
+                            </div>
+                        </aside>
+
+                    </div>
+
+                    {/* History Section */}
+                    <section id="history" className="bg-slate-50 border-t border-gray-200 px-8 py-10">
+                        <div className="max-w-7xl mx-auto">
+                            <h3 className="font-semibold text-lg text-gray-900 mb-4">Rendering History</h3>
+                            <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
+                                {history.length === 0 ? (
+                                    <div className="p-8 text-center text-gray-400 text-xs">
+                                        No rendered mockup history found on this device.
+                                    </div>
+                                ) : (
+                                    <table className="min-w-full divide-y divide-gray-200">
+                                        <thead className="bg-gray-50">
+                                            <tr>
+                                                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Template</th>
+                                                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Format</th>
+                                                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Resolution</th>
+                                                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Timestamp</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="bg-white divide-y divide-gray-100 text-xs text-gray-700">
+                                            {history.map(item => (
+                                                <tr key={item.id}>
+                                                    <td className="px-6 py-4 font-medium text-gray-900 capitalize">{item.template_id.replace("_", " ")}</td>
+                                                    <td className="px-6 py-4 uppercase font-semibold text-blue-600">{item.export_format}</td>
+                                                    <td className="px-6 py-4">{item.width} x {item.height} px</td>
+                                                    <td className="px-6 py-4 text-gray-400">{item.timestamp}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                )}
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById("root"));
+        root.render(<App />);
+    </script>
+</body>
+</html>
