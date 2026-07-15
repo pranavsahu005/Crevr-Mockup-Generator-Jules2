@@ -1,0 +1,1058 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crevr Mockup Generator — Professional Compositing Suite</title>
+    <!-- Tailwind CSS (No frosted glass/gradients, clean white high-contrast) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & Babel -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Fabric.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.1/fabric.min.js"></script>
+    <!-- Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #ffffff;
+            color: #111111;
+        }
+        /* Custom crop overlay styling */
+        .crop-handle {
+            border: 2px solid #2196F3;
+            background: #ffffff;
+            position: absolute;
+            width: 10px;
+            height: 10px;
+        }
+    </style>
+</head>
+<body class="bg-white antialiased">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // Custom State History for Undo / Redo
+        class StateHistory {
+            constructor(initialState) {
+                this.history = [JSON.stringify(initialState)];
+                this.index = 0;
+            }
+
+            push(state) {
+                const serialized = JSON.stringify(state);
+                if (serialized === this.history[this.index]) return;
+                this.history = this.history.slice(0, this.index + 1);
+                this.history.push(serialized);
+                this.index = this.history.length - 1;
+            }
+
+            undo() {
+                if (this.index > 0) {
+                    this.index--;
+                    return JSON.parse(this.history[this.index]);
+                }
+                return null;
+            }
+
+            redo() {
+                if (this.index < this.history.length - 1) {
+                    this.index++;
+                    return JSON.parse(this.history[this.index]);
+                }
+                return null;
+            }
+        }
+
+        function App() {
+            const [templates, setTemplates] = useState([]);
+            const [selectedTemplate, setSelectedTemplate] = useState(null);
+            const [activeCategory, setActiveCategory] = useState("all");
+
+            // Design state
+            const [originalDesign, setOriginalDesign] = useState(null); // original uploaded base64
+            const [designImage, setDesignImage] = useState(null); // active cropped base64
+            const [designMeta, setDesignMeta] = useState(null);
+
+            const [isRendering, setIsRendering] = useState(false);
+            const [renderedOutput, setRenderedOutput] = useState(null);
+            const [history, setHistory] = useState([]);
+
+            // Canvas positioning & rendering options
+            const [scale, setScale] = useState(0.4);
+            const [rotation, setRotation] = useState(0);
+            const [offsetX, setOffsetX] = useState(0);
+            const [offsetY, setOffsetY] = useState(0);
+
+            const [blendMode, setBlendMode] = useState("multiply");
+            const [colorCorrect, setColorCorrect] = useState(true);
+            const [featherRadius, setFeatherRadius] = useState(5);
+            const [foldIntensity, setFoldIntensity] = useState(15);
+
+            // Phase 2 sliders
+            const [garmentColor, setGarmentColor] = useState(""); // empty means original white t-shirt
+            const [cornerRadius, setCornerRadius] = useState(0);
+            const [perspectiveBend, setPerspectiveBend] = useState(0);
+            const [removeBackground, setRemoveBackground] = useState(false);
+
+            // Export properties
+            const [exportFormat, setExportFormat] = useState("png");
+            const [dpi, setDpi] = useState(300);
+            const [physicalWidth, setPhysicalWidth] = useState(100);
+            const [physicalHeight, setPhysicalHeight] = useState(100);
+            const [usePhysicalDims, setUsePhysicalDims] = useState(false);
+
+            // Bounding scale factor
+            const [fitScale, setFitScale] = useState(1.0);
+
+            // Simple Crop state
+            const [isCropping, setIsCropping] = useState(false);
+            const [cropX, setCropX] = useState(10);
+            const [cropY, setCropY] = useState(10);
+            const [cropW, setCropW] = useState(80);
+            const [cropH, setCropH] = useState(80);
+
+            // Undo / Redo History
+            const historyTracker = useRef(null);
+
+            const canvasRef = useRef(null);
+            const fabricCanvas = useRef(null);
+
+            // Define design state object for tracking changes
+            const getDesignState = () => ({
+                scale,
+                rotation,
+                offsetX,
+                offsetY,
+                blendMode,
+                colorCorrect,
+                featherRadius,
+                foldIntensity,
+                garmentColor,
+                cornerRadius,
+                perspectiveBend,
+                removeBackground,
+                designImage
+            });
+
+            // Initialize tracker once state parameters are loaded
+            useEffect(() => {
+                historyTracker.current = new StateHistory(getDesignState());
+            }, []);
+
+            // Apply loaded state on Undo / Redo
+            const applyState = (state) => {
+                if (!state) return;
+                setScale(state.scale);
+                setRotation(state.rotation);
+                setOffsetX(state.offsetX);
+                setOffsetY(state.offsetY);
+                setBlendMode(state.blendMode);
+                setColorCorrect(state.colorCorrect);
+                setFeatherRadius(state.featherRadius);
+                setFoldIntensity(state.foldIntensity);
+                setGarmentColor(state.garmentColor);
+                setCornerRadius(state.cornerRadius);
+                setPerspectiveBend(state.perspectiveBend);
+                setRemoveBackground(state.removeBackground);
+                setDesignImage(state.designImage);
+
+                // Re-render design image on Fabric canvas if needed
+                if (state.designImage) {
+                    addDesignToCanvas(state.designImage, state.scale, state.rotation, state.offsetX, state.offsetY);
+                }
+            };
+
+            const triggerStateChange = (updatedFields = {}) => {
+                const currentState = { ...getDesignState(), ...updatedFields };
+                if (historyTracker.current) {
+                    historyTracker.current.push(currentState);
+                }
+            };
+
+            // Fetch templates & history on mount
+            useEffect(() => {
+                fetch("/api/templates")
+                    .then(res => res.json())
+                    .then(data => {
+                        setTemplates(data);
+                        if (data.length > 0) {
+                            selectTemplate(data[0]);
+                        }
+                    });
+                fetchHistory();
+            }, []);
+
+            const fetchHistory = () => {
+                fetch("/api/history")
+                    .then(res => res.json())
+                    .then(data => setHistory(data));
+            };
+
+            const selectTemplate = (tpl) => {
+                setSelectedTemplate(tpl);
+                setFoldIntensity(tpl.fold_intensity || 15);
+                setRenderedOutput(null);
+                setGarmentColor("");
+
+                // Initialize fabric canvas with the template's base photo
+                setTimeout(() => {
+                    initFabricCanvas(tpl);
+                }, 100);
+            };
+
+            const initFabricCanvas = (tpl) => {
+                if (fabricCanvas.current) {
+                    fabricCanvas.current.dispose();
+                }
+
+                const container = document.getElementById("canvas-container");
+                if (!container) return;
+
+                const width = container.clientWidth;
+                const height = 500;
+
+                const canvas = new fabric.Canvas("fabric-canvas", {
+                    width: width,
+                    height: height,
+                    backgroundColor: "#ffffff",
+                    preserveObjectStacking: true
+                });
+
+                fabricCanvas.current = canvas;
+
+                const baseImgUrl = `/templates/${tpl.id}/${tpl.base_image}`;
+                fabric.Image.fromURL(baseImgUrl, (oImg) => {
+                    oImg.set({
+                        selectable: false,
+                        evented: false,
+                        originX: "left",
+                        originY: "top"
+                    });
+
+                    const scaleX = width / oImg.width;
+                    const scaleY = height / oImg.height;
+                    const currentFitScale = Math.min(scaleX, scaleY);
+                    setFitScale(currentFitScale);
+
+                    oImg.scale(currentFitScale);
+                    canvas.setWidth(oImg.width * currentFitScale);
+                    canvas.setHeight(oImg.height * currentFitScale);
+                    canvas.add(oImg);
+                    canvas.sendToBack(oImg);
+
+                    // Add visual design zone guide
+                    const corners = tpl.design_zone_corners;
+                    if (corners && corners.length === 4) {
+                        const xs = corners.map(c => c[0]);
+                        const ys = corners.map(c => c[1]);
+                        const minX = Math.min(...xs);
+                        const maxX = Math.max(...xs);
+                        const minY = Math.min(...ys);
+                        const maxY = Math.max(...ys);
+
+                        const rect = new fabric.Rect({
+                            left: minX * currentFitScale,
+                            top: minY * currentFitScale,
+                            width: (maxX - minX) * currentFitScale,
+                            height: (maxY - minY) * currentFitScale,
+                            fill: "rgba(33, 150, 243, 0.05)",
+                            stroke: "#2196F3",
+                            strokeWidth: 1.5,
+                            strokeDashArray: [4, 4],
+                            selectable: false,
+                            evented: false
+                        });
+                        canvas.add(rect);
+                    }
+
+                    canvas.renderAll();
+                });
+
+                canvas.on("object:moving", updateTransformParams);
+                canvas.on("object:scaling", updateTransformParams);
+                canvas.on("object:rotating", updateTransformParams);
+            };
+
+            const updateTransformParams = (e) => {
+                const activeObj = e.target;
+                if (!activeObj || !selectedTemplate) return;
+
+                const canvasW = fabricCanvas.current.width;
+                setScale(activeObj.scaleX);
+                setRotation(activeObj.angle);
+                setOffsetX(Math.round(activeObj.left - canvasW / 2));
+                setOffsetY(Math.round(activeObj.top - 250));
+            };
+
+            // Analyze and warn about image quality
+            const analyzeImageQuality = (imgSrc, file) => {
+                const img = new Image();
+                img.onload = () => {
+                    const quality = (img.width >= 1000 && img.height >= 1000) ? "Excellent" : (img.width >= 500 && img.height >= 500) ? "Good" : "Low";
+                    setDesignMeta({
+                        width: img.width,
+                        height: img.height,
+                        aspectRatio: (img.width / img.height).toFixed(2),
+                        fileSize: file ? (file.size / 1024).toFixed(1) + " KB" : "Unknown",
+                        quality: quality,
+                        transparency: imgSrc.includes("image/png") || imgSrc.includes("image/webp") ? "Transparent Capability" : "Opaque"
+                    });
+                };
+                img.src = imgSrc;
+            };
+
+            const handleDesignUpload = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    const b64Data = event.target.result;
+                    setOriginalDesign(b64Data);
+                    setDesignImage(b64Data);
+                    analyzeImageQuality(b64Data, file);
+
+                    addDesignToCanvas(b64Data);
+                    triggerStateChange({ designImage: b64Data });
+                };
+                reader.readAsDataURL(file);
+            };
+
+            const addDesignToCanvas = (b64Data, customScale, customRot, customOffX, customOffY) => {
+                fabric.Image.fromURL(b64Data, (img) => {
+                    const objects = fabricCanvas.current.getObjects();
+                    objects.forEach(obj => {
+                        if (obj.id === "user-design") {
+                            fabricCanvas.current.remove(obj);
+                        }
+                    });
+
+                    const canvasW = fabricCanvas.current.width;
+                    const canvasH = fabricCanvas.current.height;
+
+                    img.set({
+                        id: "user-design",
+                        left: customOffX !== undefined ? (canvasW / 2 + customOffX) : canvasW / 2,
+                        top: customOffY !== undefined ? (250 + customOffY) : canvasH / 2,
+                        angle: customRot !== undefined ? customRot : 0,
+                        originX: "center",
+                        originY: "center",
+                        cornerColor: "#2196F3",
+                        cornerSize: 8,
+                        transparentCorners: false
+                    });
+
+                    if (customScale !== undefined) {
+                        img.scale(customScale);
+                    } else {
+                        img.scaleToWidth(canvasW * 0.35);
+                    }
+
+                    fabricCanvas.current.add(img);
+                    fabricCanvas.current.setActiveObject(img);
+                    fabricCanvas.current.renderAll();
+
+                    setScale(img.scaleX);
+                    setRotation(img.angle);
+                });
+            };
+
+            // Custom Crop Trigger
+            const applyCrop = () => {
+                const img = new Image();
+                img.onload = () => {
+                    const canvas = document.createElement("canvas");
+                    const ctx = canvas.getContext("2d");
+
+                    const w = img.width;
+                    const h = img.height;
+
+                    // Map percentage boundaries to design pixel coordinates
+                    const cx = (cropX / 100) * w;
+                    const cy = (cropY / 100) * h;
+                    const cw = (cropW / 100) * w;
+                    const ch = (cropH / 100) * h;
+
+                    canvas.width = cw;
+                    canvas.height = ch;
+
+                    ctx.drawImage(img, cx, cy, cw, ch, 0, 0, cw, ch);
+                    const croppedB64 = canvas.toDataURL("image/png");
+
+                    setDesignImage(croppedB64);
+                    addDesignToCanvas(croppedB64);
+                    setIsCropping(false);
+                    triggerStateChange({ designImage: croppedB64 });
+                };
+                img.src = originalDesign;
+            };
+
+            const resetDesign = () => {
+                if (originalDesign) {
+                    setDesignImage(originalDesign);
+                    addDesignToCanvas(originalDesign, 0.4, 0, 0, 0);
+                    setScale(0.4);
+                    setRotation(0);
+                    setOffsetX(0);
+                    setOffsetY(0);
+                    setGarmentColor("");
+                    setCornerRadius(0);
+                    setPerspectiveBend(0);
+                    setRemoveBackground(false);
+                    triggerStateChange({
+                        scale: 0.4,
+                        rotation: 0,
+                        offsetX: 0,
+                        offsetY: 0,
+                        garmentColor: "",
+                        cornerRadius: 0,
+                        perspectiveBend: 0,
+                        removeBackground: false,
+                        designImage: originalDesign
+                    });
+                }
+            };
+
+            const triggerRenderPipeline = () => {
+                if (!selectedTemplate || !designImage) {
+                    alert("Please upload a custom design logo first.");
+                    return;
+                }
+
+                setIsRendering(true);
+
+                // Compute exact high-res coordinates of the design layer's four corners
+                let highResDstCorners = null;
+                const activeObj = fabricCanvas.current.getObjects().find(obj => obj.id === "user-design");
+                if (activeObj) {
+                    const coords = activeObj.getCoords();
+                    highResDstCorners = coords.map(pt => [pt.x / fitScale, pt.y / fitScale]);
+                }
+
+                const body = {
+                    template_id: selectedTemplate.id,
+                    design_base64: designImage,
+                    dst_corners: highResDstCorners,
+                    blend_mode: blendMode,
+                    color_correct: colorCorrect,
+                    feather_radius: featherRadius,
+                    fold_intensity: foldIntensity,
+                    export_format: exportFormat,
+                    dpi: dpi,
+                    physical_size_mm: usePhysicalDims ? [physicalWidth, physicalHeight] : null,
+
+                    // Phase 2 Parameters
+                    garment_color: garmentColor || null,
+                    corner_radius: parseFloat(cornerRadius),
+                    perspective_bend: parseFloat(perspectiveBend),
+                    remove_background: removeBackground
+                };
+
+                fetch("/api/render", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify(body)
+                })
+                .then(res => {
+                    if (!res.ok) {
+                        return res.json().then(err => { throw new Error(err.detail || "Failed to render") });
+                    }
+                    return res.json();
+                })
+                .then(data => {
+                    setRenderedOutput(data.mockup_base64);
+                    setIsRendering(false);
+                    fetchHistory();
+                })
+                .catch(err => {
+                    alert("Error processing pipeline: " + err.message);
+                    setIsRendering(false);
+                });
+            };
+
+            const downloadMockup = () => {
+                if (!renderedOutput) return;
+                const link = document.createElement("a");
+                link.href = renderedOutput;
+                link.download = `crevr-mockup-${selectedTemplate.id}.${exportFormat}`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            };
+
+            // Standard garment recoloring swatches
+            const garmentSwatches = [
+                { name: "Original", value: "" },
+                { name: "White", value: "#ffffff" },
+                { name: "Black", value: "#1a1a1a" },
+                { name: "Red", value: "#e53935" },
+                { name: "Blue", value: "#1e88e5" },
+                { name: "Green", value: "#43a047" },
+                { name: "Orange", value: "#fb8c00" },
+                { name: "Purple", value: "#8e24aa" }
+            ];
+
+            const categories = ["all", "apparel", "tech", "print"];
+
+            return (
+                <div className="min-h-screen flex flex-col bg-white">
+                    {/* Header */}
+                    <header className="bg-white border-b border-gray-200 px-6 py-4 flex justify-between items-center">
+                        <div className="flex items-center gap-3">
+                            <span className="font-semibold text-xl tracking-tight text-gray-900">Crevr Mockup Generator</span>
+                            <span className="bg-blue-100 text-blue-800 text-xs font-medium px-2.5 py-0.5 rounded">Phase 2 Engine</span>
+                        </div>
+                        <div className="flex items-center gap-4 text-sm font-semibold">
+                            <button
+                                onClick={() => applyState(historyTracker.current?.undo())}
+                                className="px-3 py-1.5 border border-gray-200 hover:bg-gray-50 rounded text-xs"
+                            >
+                                Undo
+                            </button>
+                            <button
+                                onClick={() => applyState(historyTracker.current?.redo())}
+                                className="px-3 py-1.5 border border-gray-200 hover:bg-gray-50 rounded text-xs"
+                            >
+                                Redo
+                            </button>
+                            <button
+                                onClick={resetDesign}
+                                className="px-3 py-1.5 border border-red-200 hover:bg-red-50 text-red-600 rounded text-xs"
+                            >
+                                Reset
+                            </button>
+                        </div>
+                    </header>
+
+                    {/* Main Workspace */}
+                    <div className="flex-1 flex overflow-hidden">
+
+                        {/* Sidebar Left: Template & Design upload */}
+                        <aside className="w-80 border-r border-gray-200 bg-white p-6 overflow-y-auto flex flex-col gap-6">
+                            <div>
+                                <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">1. Select Template</h2>
+                                <div className="flex gap-1 bg-gray-100 p-1 rounded-lg mb-4">
+                                    {categories.map(cat => (
+                                        <button
+                                            key={cat}
+                                            onClick={() => setActiveCategory(cat)}
+                                            className={`flex-1 py-1 text-xs font-medium rounded capitalize transition-colors ${
+                                                activeCategory === cat ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-900"
+                                            }`}
+                                        >
+                                            {cat}
+                                        </button>
+                                    ))}
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-3">
+                                    {templates
+                                        .filter(t => activeCategory === "all" || t.category === activeCategory)
+                                        .map(tpl => (
+                                            <button
+                                                key={tpl.id}
+                                                onClick={() => selectTemplate(tpl)}
+                                                className={`group relative text-left border rounded-lg overflow-hidden transition-all ${
+                                                    selectedTemplate?.id === tpl.id
+                                                        ? "border-blue-500 ring-2 ring-blue-100"
+                                                        : "border-gray-200 hover:border-gray-300"
+                                                }`}
+                                            >
+                                                <div className="aspect-square bg-gray-50 flex items-center justify-center overflow-hidden">
+                                                    <img
+                                                        src={`/templates/${tpl.id}/${tpl.base_image}`}
+                                                        alt={tpl.label}
+                                                        className="object-cover w-full h-full group-hover:scale-105 transition-transform duration-200"
+                                                    />
+                                                </div>
+                                                <div className="p-2 border-t border-gray-100 bg-white">
+                                                    <p className="text-xs font-medium text-gray-900 truncate">{tpl.label}</p>
+                                                    <p className="text-[10px] text-gray-400 capitalize">{tpl.category}</p>
+                                                </div>
+                                            </button>
+                                        ))}
+                                </div>
+                            </div>
+
+                            {/* Design File Upload & Analyzer */}
+                            <div className="border-t border-gray-100 pt-6">
+                                <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">2. Upload Artwork</h2>
+                                <div className="border-2 border-dashed border-gray-200 rounded-lg p-6 text-center hover:border-blue-500 transition-colors bg-slate-50 cursor-pointer relative">
+                                    <input
+                                        type="file"
+                                        accept="image/*"
+                                        onChange={handleDesignUpload}
+                                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                                    />
+                                    <svg className="mx-auto h-12 w-12 text-gray-400" stroke="currentColor" fill="none" viewBox="0 0 48 48">
+                                        <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                    </svg>
+                                    <p className="mt-2 text-xs font-medium text-gray-700">PNG, WEBP, or JPG</p>
+                                </div>
+
+                                {designMeta && (
+                                    <div className="mt-4 p-4 bg-gray-50 border border-gray-200 rounded-lg flex flex-col gap-2">
+                                        <h3 className="text-xs font-semibold text-gray-700">Quality Analysis:</h3>
+                                        <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] text-gray-600">
+                                            <span>Dimensions:</span><span className="font-medium text-gray-900">{designMeta.width}x{designMeta.height} px</span>
+                                            <span>Format:</span><span className="font-medium text-gray-900">{designMeta.transparency}</span>
+                                            <span>File Size:</span><span className="font-medium text-gray-900">{designMeta.fileSize}</span>
+                                        </div>
+                                        {designMeta.quality === "Low" && (
+                                            <p className="text-[10px] text-red-500 font-semibold mt-1">⚠️ Low quality for printing.</p>
+                                        )}
+                                        <button
+                                            onClick={() => setIsCropping(true)}
+                                            className="w-full mt-2 py-1 bg-white hover:bg-gray-100 border border-gray-200 text-[10px] font-semibold rounded text-gray-700"
+                                        >
+                                            Open Crop Tool
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+                        </aside>
+
+                        {/* Middle Area: Interactive Canvas & Previews */}
+                        <main className="flex-1 bg-slate-50 p-8 flex flex-col gap-6 overflow-y-auto">
+
+                            <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
+                                <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center bg-white">
+                                    <h3 className="font-semibold text-sm text-gray-900">Interactive Setup</h3>
+                                    <span className="text-xs text-gray-400">Section Hiding enabled</span>
+                                </div>
+                                <div id="canvas-container" className="p-6 flex justify-center bg-gray-50">
+                                    <canvas id="fabric-canvas"></canvas>
+                                </div>
+                            </div>
+
+                            {/* Server Render Output Preview */}
+                            <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
+                                <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center">
+                                    <h3 className="font-semibold text-sm text-gray-900">High-Fidelity Render Output</h3>
+                                    {renderedOutput && (
+                                        <button
+                                            onClick={downloadMockup}
+                                            className="px-4 py-1.5 bg-green-600 hover:bg-green-700 text-white text-xs font-semibold rounded-lg shadow-sm transition-colors"
+                                        >
+                                            Download Final Image
+                                        </button>
+                                    )}
+                                </div>
+                                <div className="p-6 flex justify-center bg-slate-100 min-h-[300px] items-center relative">
+                                    {isRendering ? (
+                                        <div className="text-center">
+                                            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-3"></div>
+                                            <p className="text-xs font-medium text-gray-600">Executing OpenCV compositing, displacement mappings & blends...</p>
+                                        </div>
+                                    ) : renderedOutput ? (
+                                        <img src={renderedOutput} alt="Mockup Output" className="max-h-[500px] object-contain border border-gray-200 shadow-lg bg-white rounded-lg" />
+                                    ) : (
+                                        <div className="text-center text-gray-400 p-8">
+                                            <svg className="mx-auto h-12 w-12 text-gray-300 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                            </svg>
+                                            <p className="text-xs font-medium">Click "Preview (Full Render)" inside properties sidebar to trigger rendering.</p>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </main>
+
+                        {/* Sidebar Right: Sliders & Color Swatches */}
+                        <aside className="w-80 border-l border-gray-200 bg-white p-6 overflow-y-auto flex flex-col gap-6">
+
+                            {/* Garment Color Swatches */}
+                            {selectedTemplate?.category === "apparel" && (
+                                <div className="border-b border-gray-100 pb-6">
+                                    <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Garment Color</h2>
+                                    <div className="flex flex-wrap gap-2">
+                                        {garmentSwatches.map(sw => (
+                                            <button
+                                                key={sw.name}
+                                                onClick={() => {
+                                                    setGarmentColor(sw.value);
+                                                    triggerStateChange({ garmentColor: sw.value });
+                                                }}
+                                                className={`w-8 h-8 rounded-full border border-gray-300 shadow-sm relative transition-all ${
+                                                    garmentColor === sw.value ? "ring-2 ring-blue-500 scale-105" : "hover:scale-105"
+                                                }`}
+                                                style={{ backgroundColor: sw.value || "#efefef" }}
+                                                title={sw.name}
+                                            >
+                                                {sw.value === "" && <span className="absolute inset-0 flex items-center justify-center text-[10px] font-semibold text-gray-500">Orig</span>}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    <div className="mt-3 flex items-center gap-2">
+                                        <span className="text-[10px] text-gray-500 font-medium">Custom HEX:</span>
+                                        <input
+                                            type="color"
+                                            value={garmentColor || "#ffffff"}
+                                            onChange={(e) => {
+                                                setGarmentColor(e.target.value);
+                                                triggerStateChange({ garmentColor: e.target.value });
+                                            }}
+                                            className="w-6 h-6 border border-gray-200 rounded"
+                                        />
+                                        <input
+                                            type="text"
+                                            value={garmentColor}
+                                            onChange={(e) => {
+                                                setGarmentColor(e.target.value);
+                                                triggerStateChange({ garmentColor: e.target.value });
+                                            }}
+                                            placeholder="#FFFFFF"
+                                            className="text-[10px] border border-gray-200 rounded px-1.5 py-1 w-20 uppercase font-mono"
+                                        />
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Render Settings */}
+                            <div>
+                                <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">3. Render Settings</h2>
+                                <div className="flex flex-col gap-4">
+
+                                    {/* Corner Radius Slider */}
+                                    <div>
+                                        <div className="flex justify-between mb-1">
+                                            <label className="text-xs font-medium text-gray-700">Corner Radius (Screens)</label>
+                                            <span className="text-xs font-semibold text-gray-500">{cornerRadius}px</span>
+                                        </div>
+                                        <input
+                                            type="range"
+                                            min="0"
+                                            max="50"
+                                            value={cornerRadius}
+                                            onChange={(e) => {
+                                                const val = parseFloat(e.target.value);
+                                                setCornerRadius(val);
+                                                triggerStateChange({ cornerRadius: val });
+                                            }}
+                                            className="w-full accent-blue-600 h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                                        />
+                                    </div>
+
+                                    {/* Perspective Tilt / Bend Slider */}
+                                    <div>
+                                        <div className="flex justify-between mb-1">
+                                            <label className="text-xs font-medium text-gray-700">Perspective Tilt / Bend</label>
+                                            <span className="text-xs font-semibold text-gray-500">{perspectiveBend}%</span>
+                                        </div>
+                                        <input
+                                            type="range"
+                                            min="-50"
+                                            max="50"
+                                            value={perspectiveBend}
+                                            onChange={(e) => {
+                                                const val = parseFloat(e.target.value);
+                                                setPerspectiveBend(val);
+                                                triggerStateChange({ perspectiveBend: val });
+                                            }}
+                                            className="w-full accent-blue-600 h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                                        />
+                                    </div>
+
+                                    {/* Fold Intensity (Displacement Scale) */}
+                                    <div>
+                                        <div className="flex justify-between mb-1">
+                                            <label className="text-xs font-medium text-gray-700">Fold Intensity (Displacement)</label>
+                                            <span className="text-xs font-semibold text-gray-500">{foldIntensity}px</span>
+                                        </div>
+                                        <input
+                                            type="range"
+                                            min="0"
+                                            max="50"
+                                            value={foldIntensity}
+                                            onChange={(e) => {
+                                                const val = parseFloat(e.target.value);
+                                                setFoldIntensity(val);
+                                                triggerStateChange({ foldIntensity: val });
+                                            }}
+                                            className="w-full accent-blue-600 h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                                        />
+                                    </div>
+
+                                    {/* Edge Feathering */}
+                                    <div>
+                                        <div className="flex justify-between mb-1">
+                                            <label className="text-xs font-medium text-gray-700">Edge Feathering Radius</label>
+                                            <span className="text-xs font-semibold text-gray-500">{featherRadius}px</span>
+                                        </div>
+                                        <input
+                                            type="range"
+                                            min="0"
+                                            max="15"
+                                            value={featherRadius}
+                                            onChange={(e) => {
+                                                const val = parseInt(e.target.value);
+                                                setFeatherRadius(val);
+                                                triggerStateChange({ featherRadius: val });
+                                            }}
+                                            className="w-full accent-blue-600 h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                                        />
+                                    </div>
+
+                                    {/* Background Removal (Chroma-key) */}
+                                    <div className="flex items-center justify-between p-2 bg-gray-50 border border-gray-200 rounded-lg">
+                                        <div>
+                                            <label className="text-xs font-semibold text-gray-700">Remove Solid Background</label>
+                                            <p className="text-[10px] text-gray-400">Chroma-key backdrops</p>
+                                        </div>
+                                        <input
+                                            type="checkbox"
+                                            checked={removeBackground}
+                                            onChange={(e) => {
+                                                setRemoveBackground(e.target.checked);
+                                                triggerStateChange({ removeBackground: e.target.checked });
+                                            }}
+                                            className="w-4 h-4 text-blue-600 accent-blue-600 bg-gray-100 border-gray-300 rounded"
+                                        />
+                                    </div>
+
+                                    {/* Photometric Blending Mode */}
+                                    <div>
+                                        <label className="block text-xs font-medium text-gray-700 mb-1">Photometric Blend Mode</label>
+                                        <select
+                                            value={blendMode}
+                                            onChange={(e) => {
+                                                setBlendMode(e.target.value);
+                                                triggerStateChange({ blendMode: e.target.value });
+                                            }}
+                                            className="w-full text-xs bg-gray-50 border border-gray-200 rounded-lg p-2 focus:border-blue-500 focus:outline-none"
+                                        >
+                                            <option value="multiply">Multiply (Perfect for Shadows)</option>
+                                            <option value="overlay">Overlay (Balanced Highlights)</option>
+                                            <option value="linear_burn">Linear Burn (Deep Wrinkles)</option>
+                                        </select>
+                                    </div>
+
+                                    {/* Color Correction Toggle */}
+                                    <div className="flex items-center justify-between p-2 bg-gray-50 border border-gray-200 rounded-lg">
+                                        <div>
+                                            <label className="text-xs font-semibold text-gray-700">LAB Histogram Match</label>
+                                        </div>
+                                        <input
+                                            type="checkbox"
+                                            checked={colorCorrect}
+                                            onChange={(e) => {
+                                                setColorCorrect(e.target.checked);
+                                                triggerStateChange({ colorCorrect: e.target.checked });
+                                            }}
+                                            className="w-4 h-4 text-blue-600 accent-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500 focus:ring-2"
+                                        />
+                                    </div>
+
+                                    {/* Generate/Render Button */}
+                                    <button
+                                        onClick={triggerRenderPipeline}
+                                        disabled={isRendering || !designImage}
+                                        className={`w-full py-2.5 text-xs font-semibold rounded-lg shadow transition-colors flex items-center justify-center gap-2 ${
+                                            designImage
+                                                ? "bg-blue-600 hover:bg-blue-700 text-white"
+                                                : "bg-gray-100 text-gray-400 cursor-not-allowed"
+                                        }`}
+                                    >
+                                        {isRendering ? "Processing..." : "Preview (Full Render)"}
+                                    </button>
+
+                                </div>
+                            </div>
+
+                            {/* High-Resolution Export Panel */}
+                            <div className="border-t border-gray-100 pt-6">
+                                <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">4. Export Options</h2>
+                                <div className="flex flex-col gap-4">
+
+                                    <div className="grid grid-cols-3 gap-1 bg-gray-100 p-1 rounded-lg">
+                                        {["png", "jpg", "webp"].map(fmt => (
+                                            <button
+                                                key={fmt}
+                                                onClick={() => setExportFormat(fmt)}
+                                                className={`py-1 text-xs font-semibold rounded capitalize ${
+                                                    exportFormat === fmt ? "bg-white text-gray-900 shadow-sm" : "text-gray-500"
+                                                }`}
+                                            >
+                                                {fmt}
+                                            </button>
+                                        ))}
+                                    </div>
+
+                                    <div className="flex items-center justify-between">
+                                        <span className="text-xs font-medium text-gray-700">Print DPI Rescaling</span>
+                                        <input
+                                            type="checkbox"
+                                            checked={usePhysicalDims}
+                                            onChange={(e) => setUsePhysicalDims(e.target.checked)}
+                                            className="accent-blue-600"
+                                        />
+                                    </div>
+
+                                    {usePhysicalDims && (
+                                        <div className="flex flex-col gap-3 p-3 bg-gray-50 border border-gray-100 rounded-lg">
+                                            <div className="flex gap-2">
+                                                <div className="flex-1">
+                                                    <label className="block text-[10px] text-gray-500 mb-0.5">Width (mm)</label>
+                                                    <input
+                                                        type="number"
+                                                        value={physicalWidth}
+                                                        onChange={(e) => setPhysicalWidth(parseFloat(e.target.value))}
+                                                        className="w-full text-xs p-1.5 border border-gray-200 rounded"
+                                                    />
+                                                </div>
+                                                <div className="flex-1">
+                                                    <label className="block text-[10px] text-gray-500 mb-0.5">Height (mm)</label>
+                                                    <input
+                                                        type="number"
+                                                        value={physicalHeight}
+                                                        onChange={(e) => setPhysicalHeight(parseFloat(e.target.value))}
+                                                        className="w-full text-xs p-1.5 border border-gray-200 rounded"
+                                                    />
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-[10px] text-gray-500 mb-0.5">DPI</label>
+                                                <select
+                                                    value={dpi}
+                                                    onChange={(e) => setDpi(parseInt(e.target.value))}
+                                                    className="w-full text-xs p-1.5 border border-gray-200 rounded"
+                                                >
+                                                    <option value={72}>72 DPI (Web Preview)</option>
+                                                    <option value={150}>150 DPI (Standard)</option>
+                                                    <option value={300}>300 DPI (High-Quality Print)</option>
+                                                    <option value={600}>600 DPI (Ultra Premium Print)</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                </div>
+                            </div>
+                        </aside>
+
+                    </div>
+
+                    {/* Simple Crop Modal Tool */}
+                    {isCropping && (
+                        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+                            <div className="bg-white border border-gray-200 rounded-xl max-w-lg w-full overflow-hidden shadow-2xl">
+                                <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center">
+                                    <h3 className="font-semibold text-sm text-gray-900">Crop Custom Design</h3>
+                                    <button onClick={() => setIsCropping(false)} className="text-gray-400 hover:text-gray-600 text-sm">Cancel</button>
+                                </div>
+                                <div className="p-6 bg-slate-50 flex items-center justify-center min-h-[300px] relative overflow-hidden">
+                                    <div className="relative border border-gray-300 shadow bg-white rounded max-w-full max-h-[400px]">
+                                        <img src={originalDesign} alt="Design Image" className="max-h-[350px] object-contain select-none" />
+
+                                        {/* Crop Boundary Select Indicator */}
+                                        <div
+                                            className="absolute border-2 border-dashed border-blue-500"
+                                            style={{
+                                                left: `${cropX}%`,
+                                                top: `${cropY}%`,
+                                                width: `${cropW}%`,
+                                                height: `${cropH}%`,
+                                                backgroundColor: "rgba(33, 150, 243, 0.15)"
+                                            }}
+                                        >
+                                            <div className="crop-handle -top-1.5 -left-1.5"></div>
+                                            <div className="crop-handle -top-1.5 -right-1.5"></div>
+                                            <div className="crop-handle -bottom-1.5 -left-1.5"></div>
+                                            <div className="crop-handle -bottom-1.5 -right-1.5"></div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="p-4 border-t border-gray-100 flex flex-col gap-3">
+                                    <div className="flex gap-4">
+                                        <div className="flex-1">
+                                            <label className="block text-[10px] text-gray-500 mb-0.5">X Position (%)</label>
+                                            <input type="range" min="0" max="80" value={cropX} onChange={(e) => setCropX(parseInt(e.target.value))} className="w-full accent-blue-600" />
+                                        </div>
+                                        <div className="flex-1">
+                                            <label className="block text-[10px] text-gray-500 mb-0.5">Y Position (%)</label>
+                                            <input type="range" min="0" max="80" value={cropY} onChange={(e) => setCropY(parseInt(e.target.value))} className="w-full accent-blue-600" />
+                                        </div>
+                                    </div>
+                                    <div className="flex gap-4">
+                                        <div className="flex-1">
+                                            <label className="block text-[10px] text-gray-500 mb-0.5">Width (%)</label>
+                                            <input type="range" min="10" max="100" value={cropW} onChange={(e) => setCropW(parseInt(e.target.value))} className="w-full accent-blue-600" />
+                                        </div>
+                                        <div className="flex-1">
+                                            <label className="block text-[10px] text-gray-500 mb-0.5">Height (%)</label>
+                                            <input type="range" min="10" max="100" value={cropH} onChange={(e) => setCropH(parseInt(e.target.value))} className="w-full accent-blue-600" />
+                                        </div>
+                                    </div>
+
+                                    <div className="flex gap-2 justify-end mt-2">
+                                        <button
+                                            onClick={() => {
+                                                setCropX(0); setCropY(0); setCropW(100); setCropH(100);
+                                            }}
+                                            className="px-4 py-1.5 border border-gray-200 hover:bg-gray-50 text-xs font-semibold rounded text-gray-700"
+                                        >
+                                            Reset Full
+                                        </button>
+                                        <button
+                                            onClick={applyCrop}
+                                            className="px-5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded shadow"
+                                        >
+                                            Apply Crop
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* History Section */}
+                    <section id="history" className="bg-slate-50 border-t border-gray-200 px-8 py-10">
+                        <div className="max-w-7xl mx-auto">
+                            <h3 className="font-semibold text-lg text-gray-900 mb-4">Rendering History</h3>
+                            <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
+                                {history.length === 0 ? (
+                                    <div className="p-8 text-center text-gray-400 text-xs">
+                                        No rendered mockup history found on this device.
+                                    </div>
+                                ) : (
+                                    <table className="min-w-full divide-y divide-gray-200">
+                                        <thead className="bg-gray-50">
+                                            <tr>
+                                                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Template</th>
+                                                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Format</th>
+                                                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Resolution</th>
+                                                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Timestamp</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="bg-white divide-y divide-gray-100 text-xs text-gray-700">
+                                            {history.map(item => (
+                                                <tr key={item.id}>
+                                                    <td className="px-6 py-4 font-medium text-gray-900 capitalize">{item.template_id.replace("_", " ")}</td>
+                                                    <td className="px-6 py-4 uppercase font-semibold text-blue-600">{item.export_format}</td>
+                                                    <td className="px-6 py-4">{item.width} x {item.height} px</td>
+                                                    <td className="px-6 py-4 text-gray-400">{item.timestamp}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                )}
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById("root"));
+        root.render(<App />);
+    </script>
+</body>
+</html>
