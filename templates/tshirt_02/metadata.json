@@ -1,0 +1,59 @@
+{
+    "id": "tshirt_02",
+    "category": "apparel",
+    "subtype": "t-shirt",
+    "label": "Casual Studio T-Shirt \u2014 Front",
+    "base_image": "base.png",
+    "mask_image": "mask.png",
+    "displacement_image": "displacement.png",
+    "lighting_image": "lighting.png",
+    "design_zone_corners": [
+        [
+            124,
+            112
+        ],
+        [
+            326,
+            112
+        ],
+        [
+            326,
+            484
+        ],
+        [
+            124,
+            484
+        ]
+    ],
+    "fold_intensity": 18.0,
+    "allow_rotation": true,
+    "rotation_limits_deg": [
+        -15,
+        15
+    ],
+    "allow_perspective_adjust": true,
+    "recommended_design_resolution_px": [
+        1500,
+        1500
+    ],
+    "min_upload_resolution_px": [
+        400,
+        400
+    ],
+    "max_upload_resolution_px": [
+        5000,
+        5000
+    ],
+    "supported_formats": [
+        "png",
+        "jpg",
+        "webp"
+    ],
+    "export_default_format": "png",
+    "export_max_resolution_px": [
+        3000,
+        3000
+    ],
+    "created_at": "2026-07-15",
+    "engine_version": "1.0"
+}
