@@ -74,3 +74,23 @@ def test_export_dimensions():
     # Test millimeter to pixel DPI conversion
     dims = calculate_export_dimensions((101.6, 152.4), 300) # 4x6 inches at 300 DPI
     assert dims == (1200, 1800)
+
+def test_metadata_encoding_and_existence():
+    # Verify that all template metadata.json files exist, are UTF-8 encoded, and readable
+    import json
+    import os
+
+    template_ids = ["laptop_01", "tshirt_01", "tshirt_02"]
+    for t_id in template_ids:
+        path = os.path.join("templates", t_id, "metadata.json")
+        assert os.path.exists(path), f"Metadata file for {t_id} does not exist!"
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            assert data["id"] == t_id
+            assert "category" in data
+            assert "base_image" in data
+            assert "mask_image" in data
+            assert "design_zone_corners" in data
+            # Ensure the label contains unicode characters if applicable and loads correctly
+            assert isinstance(data["label"], str)

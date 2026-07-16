@@ -91,7 +91,7 @@ def list_templates():
             target_dir = validate_template_id(t_id)
             meta_path = os.path.join(target_dir, "metadata.json")
             if os.path.exists(meta_path):
-                with open(meta_path, "r") as f:
+                with open(meta_path, "r", encoding="utf-8") as f:
                     meta = json.load(f)
                     templates.append(meta)
         except Exception as e:
@@ -105,7 +105,7 @@ def get_template_by_id(template_id: str):
     meta_path = os.path.join(target_dir, "metadata.json")
     if not os.path.exists(meta_path):
         raise HTTPException(status_code=404, detail=f"Template {template_id} not found")
-    with open(meta_path, "r") as f:
+    with open(meta_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def decode_base64_image(b64_str: str) -> np.ndarray:
@@ -127,7 +127,7 @@ def render_mockup(req: RenderRequest):
         raise HTTPException(status_code=404, detail=f"Template {req.template_id} not found")
 
     # Read template's metadata
-    with open(os.path.join(template_dir, "metadata.json"), "r") as f:
+    with open(os.path.join(template_dir, "metadata.json"), "r", encoding="utf-8") as f:
         meta = json.load(f)
 
     # Load support files
@@ -254,7 +254,7 @@ def get_render_history():
 def get_frontend():
     frontend_index = "frontend/index.html"
     if os.path.exists(frontend_index):
-        with open(frontend_index, "r") as f:
+        with open(frontend_index, "r", encoding="utf-8") as f:
             return HTMLResponse(f.read())
     else:
         return HTMLResponse("<h1>Crevr Frontend Not Ready Yet</h1>")
