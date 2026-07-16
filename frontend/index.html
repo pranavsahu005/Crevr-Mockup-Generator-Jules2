@@ -33,6 +33,9 @@
             const [selectedTemplate, setSelectedTemplate] = useState(null);
             const [activeCategory, setActiveCategory] = useState("all");
             const [designImage, setDesignImage] = useState(null);
+            const [uploadedDesignId, setUploadedDesignId] = useState(null);
+            const [hasAlpha, setHasAlpha] = useState(true);
+            const [isRemovingBg, setIsRenderingBg] = useState(false);
             const [isRendering, setIsRendering] = useState(false);
             const [renderedOutput, setRenderedOutput] = useState(null);
             const [history, setHistory] = useState([]);
@@ -60,16 +63,21 @@
             const canvasRef = useRef(null);
             const fabricCanvas = useRef(null);
 
-            // Fetch templates & history on mount
+            // Fetch templates on category change
             useEffect(() => {
-                fetch("/api/templates")
+                const url = activeCategory === "all" ? "/api/templates" : `/api/templates?category=${activeCategory}`;
+                fetch(url)
                     .then(res => res.json())
                     .then(data => {
                         setTemplates(data);
-                        if (data.length > 0) {
+                        if (data.length > 0 && (!selectedTemplate || !data.some(t => t.id === selectedTemplate.id))) {
                             selectTemplate(data[0]);
                         }
                     });
+            }, [activeCategory]);
+
+            // Fetch history on mount
+            useEffect(() => {
                 fetchHistory();
             }, []);
 
@@ -77,6 +85,12 @@
                 fetch("/api/history")
                     .then(res => res.json())
                     .then(data => setHistory(data));
+            };
+
+            const deleteHistory = (id) => {
+                fetch(`/api/history/${id}`, { method: "DELETE" })
+                    .then(res => res.json())
+                    .then(() => fetchHistory());
             };
 
             const selectTemplate = (tpl) => {
@@ -181,38 +195,85 @@
                 const file = e.target.files[0];
                 if (!file) return;
 
-                const reader = new FileReader();
-                reader.onload = (event) => {
-                    const b64Data = event.target.result;
-                    setDesignImage(b64Data);
+                const formData = new FormData();
+                formData.append("file", file);
+
+                fetch("/api/designs/upload", {
+                    method: "POST",
+                    body: formData
+                })
+                .then(res => {
+                    if (!res.ok) {
+                        return res.json().then(err => { throw new Error(err.detail || "Upload failed") });
+                    }
+                    return res.json();
+                })
+                .then(data => {
+                    setUploadedDesignId(data.design_id);
+                    setHasAlpha(data.has_alpha);
+
+                    const previewUrl = data.preview_url;
+                    setDesignImage(previewUrl);
 
                     // Add to Fabric canvas
-                    fabric.Image.fromURL(b64Data, (img) => {
-                        const objects = fabricCanvas.current.getObjects();
-                        objects.forEach(obj => {
-                            if (obj.id === "user-design") {
-                                fabricCanvas.current.remove(obj);
-                            }
-                        });
+                    loadDesignToCanvas(previewUrl);
+                })
+                .catch(err => {
+                    alert("Error uploading design: " + err.message);
+                });
+            };
 
-                        img.set({
-                            id: "user-design",
-                            left: fabricCanvas.current.width / 2,
-                            top: fabricCanvas.current.height / 2,
-                            originX: "center",
-                            originY: "center"
-                        });
-                        img.scaleToWidth(fabricCanvas.current.width * 0.35);
-
-                        fabricCanvas.current.add(img);
-                        fabricCanvas.current.setActiveObject(img);
-                        fabricCanvas.current.renderAll();
-
-                        setScale(img.scaleX);
-                        setRotation(img.angle);
+            const loadDesignToCanvas = (url) => {
+                fabric.Image.fromURL(url, (img) => {
+                    const objects = fabricCanvas.current.getObjects();
+                    objects.forEach(obj => {
+                        if (obj.id === "user-design") {
+                            fabricCanvas.current.remove(obj);
+                        }
                     });
-                };
-                reader.readAsDataURL(file);
+
+                    img.set({
+                        id: "user-design",
+                        left: fabricCanvas.current.width / 2,
+                        top: fabricCanvas.current.height / 2,
+                        originX: "center",
+                        originY: "center"
+                    });
+                    img.scaleToWidth(fabricCanvas.current.width * 0.35);
+
+                    fabricCanvas.current.add(img);
+                    fabricCanvas.current.setActiveObject(img);
+                    fabricCanvas.current.renderAll();
+
+                    setScale(img.scaleX);
+                    setRotation(img.angle);
+                });
+            };
+
+            const handleRemoveBg = () => {
+                if (!uploadedDesignId) return;
+                setIsRenderingBg(true);
+
+                fetch(`/api/designs/${uploadedDesignId}/remove-bg`, {
+                    method: "POST"
+                })
+                .then(res => {
+                    if (!res.ok) {
+                        return res.json().then(err => { throw new Error(err.detail || "Background removal failed") });
+                    }
+                    return res.json();
+                })
+                .then(data => {
+                    setHasAlpha(true);
+                    setIsRenderingBg(false);
+                    const freshUrl = data.preview_url + "?t=" + Date.now();
+                    setDesignImage(freshUrl);
+                    loadDesignToCanvas(freshUrl);
+                })
+                .catch(err => {
+                    alert("Background removal error: " + err.message);
+                    setIsRenderingBg(false);
+                });
             };
 
             const triggerRenderPipeline = () => {
@@ -234,7 +295,7 @@
 
                 const body = {
                     template_id: selectedTemplate.id,
-                    design_base64: designImage,
+                    design_id: uploadedDesignId,
                     dst_corners: highResDstCorners,
                     blend_mode: blendMode,
                     color_correct: colorCorrect,
@@ -318,9 +379,7 @@
                                 </div>
 
                                 <div className="grid grid-cols-2 gap-3">
-                                    {templates
-                                        .filter(t => activeCategory === "all" || t.category === activeCategory)
-                                        .map(tpl => (
+                                    {templates.map(tpl => (
                                             <button
                                                 key={tpl.id}
                                                 onClick={() => selectTemplate(tpl)}
@@ -363,14 +422,30 @@
                                     <p className="mt-1 text-[10px] text-gray-400">Click or drag & drop</p>
                                 </div>
                                 {designImage && (
-                                    <div className="mt-4 p-2 bg-gray-50 border border-gray-200 rounded-lg flex items-center gap-3">
-                                        <div className="w-12 h-12 bg-white border border-gray-100 rounded overflow-hidden flex items-center justify-center">
-                                            <img src={designImage} alt="Uploaded logo" className="object-contain max-w-full max-h-full" />
+                                    <div className="mt-4 p-2 bg-gray-50 border border-gray-200 rounded-lg flex flex-col gap-3">
+                                        <div className="flex items-center gap-3">
+                                            <div className="w-12 h-12 bg-white border border-gray-100 rounded overflow-hidden flex items-center justify-center">
+                                                <img src={designImage} alt="Uploaded logo" className="object-contain max-w-full max-h-full" />
+                                            </div>
+                                            <div className="flex-1 min-w-0">
+                                                <p className="text-xs font-semibold text-gray-900 truncate">Design File Loaded</p>
+                                                <p className="text-[10px] text-gray-400">Active on Canvas</p>
+                                            </div>
                                         </div>
-                                        <div className="flex-1 min-w-0">
-                                            <p className="text-xs font-semibold text-gray-900 truncate">Design File Loaded</p>
-                                            <p className="text-[10px] text-gray-400">Active on Canvas</p>
-                                        </div>
+
+                                        {/* Dynamic Auto Background Removal offer */}
+                                        {!hasAlpha && (
+                                            <div className="mt-1 p-2 bg-amber-50 border border-amber-200 rounded-md">
+                                                <p className="text-[11px] text-amber-800 mb-2 font-medium">This image appears to have no transparency layer (opaque background).</p>
+                                                <button
+                                                    onClick={handleRemoveBg}
+                                                    disabled={isRemovingBg}
+                                                    className="w-full py-1.5 px-3 bg-amber-600 hover:bg-amber-700 text-white font-semibold text-xs rounded transition-colors"
+                                                >
+                                                    {isRemovingBg ? "Removing Background..." : "Auto Background Removal"}
+                                                </button>
+                                            </div>
+                                        )}
                                     </div>
                                 )}
                             </div>
@@ -598,6 +673,7 @@
                                                 <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Format</th>
                                                 <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Resolution</th>
                                                 <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Timestamp</th>
+                                                <th className="px-6 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wider">Action</th>
                                             </tr>
                                         </thead>
                                         <tbody className="bg-white divide-y divide-gray-100 text-xs text-gray-700">
@@ -607,6 +683,14 @@
                                                     <td className="px-6 py-4 uppercase font-semibold text-blue-600">{item.export_format}</td>
                                                     <td className="px-6 py-4">{item.width} x {item.height} px</td>
                                                     <td className="px-6 py-4 text-gray-400">{item.timestamp}</td>
+                                                    <td className="px-6 py-4 text-right">
+                                                        <button
+                                                            onClick={() => deleteHistory(item.id)}
+                                                            className="text-red-600 hover:text-red-800 font-semibold"
+                                                        >
+                                                            Delete
+                                                        </button>
+                                                    </td>
                                                 </tr>
                                             ))}
                                         </tbody>

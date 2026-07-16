@@ -9,7 +9,8 @@ class TransformParams(BaseModel):
 
 class RenderRequest(BaseModel):
     template_id: str
-    design_base64: str  # Data URL or standard base64 string
+    design_base64: Optional[str] = None  # Data URL or standard base64 string
+    design_id: Optional[str] = None     # Uploaded design ID
     transform_params: Optional[TransformParams] = None
     dst_corners: Optional[List[List[float]]] = None  # High-res coordinates computed dynamically from client
     blend_mode: Optional[str] = "multiply"
