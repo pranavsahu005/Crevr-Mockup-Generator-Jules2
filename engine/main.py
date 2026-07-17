@@ -5,6 +5,9 @@ import base64
 import cv2
 import numpy as np
 import sqlite3
+import uuid
+import io
+from PIL import Image
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -13,12 +16,16 @@ from typing import Optional, List
 
 from engine.api.schemas import RenderRequest, RenderResponse, TransformParams
 from engine.pipeline.render import render_mockup_pipeline, calculate_export_dimensions
+from engine.pipeline.ingest import generate_lighting_overlay, generate_displacement_map, convert_to_serializable
 
 app = FastAPI(
     title="Crevr Mockup Generator Engine",
     description="Deterministic high-performance product mockup compositing engine.",
     version="1.0"
 )
+
+# Ensure uploads directory exists
+os.makedirs("data/uploads", exist_ok=True)
 
 # Enable CORS for frontend integration
 app.add_middleware(
@@ -145,10 +152,18 @@ def render_mockup(req: RenderRequest):
     dst_corners = req.dst_corners if req.dst_corners is not None else meta.get("design_zone_corners")
 
     # Decode user's custom design image
-    try:
-        design_img = decode_base64_image(req.design_base64)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to decode design image: {str(e)}")
+    if req.design_id:
+        target_path = validate_design_id(req.design_id)
+        if not os.path.exists(target_path):
+            raise HTTPException(status_code=404, detail=f"Design {req.design_id} not found")
+        design_img = cv2.imread(target_path, cv2.IMREAD_UNCHANGED)
+        if design_img is None:
+            raise HTTPException(status_code=400, detail="Failed to load design image from disk")
+    else:
+        try:
+            design_img = decode_base64_image(req.design_base64)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to decode design image: {str(e)}")
 
     h_ds, w_ds = design_img.shape[:2]
     src_corners = [[0, 0], [w_ds, 0], [w_ds, h_ds], [0, h_ds]]
@@ -248,6 +263,340 @@ def get_render_history():
     history = [dict(row) for row in rows]
     conn.close()
     return history
+
+def sniff_and_sanitize_image(file_bytes: bytes) -> tuple:
+    """
+    Sniffs magic bytes to determine mime type, checks constraints,
+    strips EXIF metadata, and returns a PIL Image and MIME type.
+    """
+    if len(file_bytes) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File size exceeds the 25MB limit")
+
+    # Sniff magic bytes
+    mime_type = None
+    if file_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime_type = "image/png"
+    elif file_bytes.startswith(b"\xff\xd8\xff"):
+        mime_type = "image/jpeg"
+    elif file_bytes.startswith(b"RIFF") and b"WEBP" in file_bytes[8:16]:
+        mime_type = "image/webp"
+    else:
+        # Extra check: allow general image formats if PIL can open them, but enforce magic signature or reject
+        raise HTTPException(status_code=400, detail="Unsupported or corrupt image format")
+
+    try:
+        img = Image.open(io.BytesIO(file_bytes))
+        img.verify()  # Corrupt image check
+        # Re-open after verify()
+        img = Image.open(io.BytesIO(file_bytes))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Corrupt or invalid image: {str(e)}")
+
+    w, h = img.size
+    if w > 8000 or h > 8000:
+        raise HTTPException(status_code=400, detail="Image resolution exceeds the 8000x8000 limit")
+
+    return img, mime_type
+
+@app.post("/api/designs/upload")
+async def upload_design(file: UploadFile = File(...)):
+    """
+    Uploads a user design, sniffs MIME-type, enforces security limits,
+    strips EXIF metadata, stores it under a random UUID, and returns ID + preprocessed preview.
+    """
+    try:
+        file_bytes = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {str(e)}")
+
+    img, mime_type = sniff_and_sanitize_image(file_bytes)
+
+    # Convert to RGBA to preserve transparency if it exists or if we save as PNG
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA")
+
+    upload_id = str(uuid.uuid4())
+    filepath = os.path.join("data/uploads", f"{upload_id}.png")
+
+    try:
+        # Saving as PNG with Pillow naturally strips EXIF metadata unless specifically supplied
+        img.save(filepath, format="PNG")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save design image: {str(e)}")
+
+    # Generate a preprocessed preview
+    # To keep network payload small, we can create a fast preview
+    preview_img = img.copy()
+    preview_img.thumbnail((800, 800))
+    buffered = io.BytesIO()
+    preview_img.save(buffered, format="PNG")
+    b64_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    preview_url = f"data:image/png;base64,{b64_str}"
+
+    return {
+        "design_id": upload_id,
+        "preview": preview_url
+    }
+
+def validate_design_id(design_id: str) -> str:
+    """
+    Validates design_id format and checks for directory traversal.
+    Returns the sanitized absolute file path.
+    """
+    if not re.match(r"^[a-zA-Z0-9_-]+$", design_id):
+        raise HTTPException(status_code=400, detail="Invalid design ID format")
+
+    base_dir = os.path.abspath("data/uploads")
+    target_path = os.path.abspath(os.path.join(base_dir, f"{design_id}.png"))
+
+    if not target_path.startswith(base_dir):
+        raise HTTPException(status_code=400, detail="Directory traversal attempt detected")
+
+    return target_path
+
+@app.post("/api/designs/{design_id}/remove-bg")
+async def remove_background(design_id: str):
+    """
+    Runs background removal using a classical OpenCV flood-fill algorithm starting from the four corners.
+    Separates 4-channel BGRA to BGR for flood filling and modifies the alpha channel of matching pixels.
+    """
+    target_path = validate_design_id(design_id)
+    if not os.path.exists(target_path):
+        raise HTTPException(status_code=404, detail="Design file not found")
+
+    # Read image with alpha channel
+    img = cv2.imread(target_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Failed to load or corrupt design image")
+
+    h, w = img.shape[:2]
+
+    # Convert to BGRA if it's 1 or 3-channel
+    if len(img.shape) == 2:  # Grayscale
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        img_bgra = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2BGRA)
+    elif img.shape[2] == 3:
+        img_bgr = img.copy()
+        img_bgra = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    else:
+        # 4-channel BGRA
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        img_bgra = img.copy()
+
+    # Create flood fill mask (H+2, W+2)
+    ff_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+
+    # We will flood-fill from all 4 corners
+    corners = [
+        (0, 0),          # Top-Left
+        (w - 1, 0),      # Top-Right
+        (0, h - 1),      # Bottom-Left
+        (w - 1, h - 1)   # Bottom-Right
+    ]
+
+    # Use a small tolerance for flood-fill (e.g. loDiff=10, upDiff=10 per channel)
+    lo_diff = (10, 10, 10)
+    up_diff = (10, 10, 10)
+    flags = cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+
+    for pt in corners:
+        cv2.floodFill(img_bgr, ff_mask, pt, 0, lo_diff, up_diff, flags)
+
+    # Extract the image mask part from ff_mask
+    bg_mask = ff_mask[1:h+1, 1:w+1]
+
+    # Set background pixels' alpha channel to 0 (fully transparent)
+    img_bgra[bg_mask == 255, 3] = 0
+
+    # Save the background removed image as a transparent PNG
+    try:
+        cv2.imwrite(target_path, img_bgra)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save background-removed image: {str(e)}")
+
+    # Return updated preview
+    success, buffer = cv2.imencode(".png", img_bgra)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to encode image to PNG preview")
+
+    b64_str = base64.b64encode(buffer).decode("utf-8")
+    preview_url = f"data:image/png;base64,{b64_str}"
+
+    return {
+        "design_id": design_id,
+        "preview": preview_url
+    }
+
+@app.post("/api/templates/ingest")
+async def ingest_template(
+    template_id: str = Form(...),
+    category: str = Form(...),
+    subtype: str = Form(...),
+    label: str = Form(...),
+    file: UploadFile = File(...)
+):
+    """
+    Admin endpoint to ingest a new base photo as a template.
+    Generates mask, displacement map, lighting overlay, and metadata.json dynamically.
+    """
+    # Validate template_id format
+    target_dir = validate_template_id(template_id)
+    os.makedirs(target_dir, exist_ok=True)
+
+    try:
+        file_bytes = await file.read()
+        nparr = np.frombuffer(file_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Invalid image file")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse base photo: {str(e)}")
+
+    h_img, w_img = img.shape[:2]
+
+    # Save base.png
+    base_path = os.path.join(target_dir, "base.png")
+    cv2.imwrite(base_path, img)
+
+    # Initialize supporting variables
+    mask_img = None
+    disp_img = None
+    light_img = None
+    corners = []
+    fold_intensity = 0.0
+
+    category_clean = category.lower().strip()
+    subtype_clean = subtype.lower().strip()
+
+    if category_clean == "tech" or subtype_clean == "laptop":
+        # Screen detection logic
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if len(contours) > 0:
+            contours = sorted(contours, key=cv2.contourArea, reverse=True)
+            screen_contour = contours[0]
+            epsilon = 0.02 * cv2.arcLength(screen_contour, True)
+            approx = cv2.approxPolyDP(screen_contour, epsilon, True)
+            if len(approx) == 4:
+                corners_l = approx.reshape(4, 2).tolist()
+                # Sort corners programmatically: TL, TR, BR, BL
+                corners_l = sorted(corners_l, key=lambda p: p[0] + p[1])
+                tl = corners_l[0]
+                br = corners_l[3]
+                other = sorted(corners_l[1:3], key=lambda p: p[0])
+                bl = other[0]
+                tr = other[1]
+                corners = [tl, tr, br, bl]
+            else:
+                corners = [[0, 0], [w_img, 0], [w_img, h_img], [0, h_img]]
+        else:
+            corners = [[0, 0], [w_img, 0], [w_img, h_img], [0, h_img]]
+
+        mask_img = binary
+        disp_img = np.ones_like(gray) * 128
+        light_img = np.ones_like(gray) * 128
+        fold_intensity = 0.0
+
+    elif category_clean == "apparel" or subtype_clean == "t-shirt":
+        # Apparel/t-shirt detection logic
+        b, g, r = cv2.split(img)
+        is_gray = (np.abs(r.astype(int) - g.astype(int)) < 15) & (np.abs(g.astype(int) - b.astype(int)) < 15)
+        is_light = (r > 130) & (g > 130) & (b > 130)
+        tshirt_mask = (is_gray & is_light).astype(np.uint8) * 255
+
+        # Check if t-shirt area is detected, otherwise fallback to entire image
+        ys, xs = np.where(tshirt_mask > 0)
+        if len(ys) > 0 and len(xs) > 0:
+            min_y, max_y = ys.min(), ys.max()
+            min_x, max_x = xs.min(), xs.max()
+
+            mask_img = np.zeros_like(tshirt_mask)
+            zone_w = int((max_x - min_x) * 0.45)
+            zone_h = int((max_y - min_y) * 0.55)
+            cx, cy = (min_x + max_x) // 2, (min_y + max_y) // 2 - 30
+
+            z_x1, z_y1 = cx - zone_w // 2, cy - zone_h // 2
+            z_x2, z_y2 = cx + zone_w // 2, cy + zone_h // 2
+            cv2.rectangle(mask_img, (z_x1, z_y1), (z_x2, z_y2), 255, -1)
+            mask_img = cv2.bitwise_and(mask_img, tshirt_mask)
+            corners = [[z_x1, z_y1], [z_x2, z_y1], [z_x2, z_y2], [z_x1, z_y2]]
+        else:
+            mask_img = np.ones((h_img, w_img), dtype=np.uint8) * 255
+            corners = [[0, 0], [w_img, 0], [w_img, h_img], [0, h_img]]
+
+        fold_intensity = 15.0
+        disp_img = generate_displacement_map(img, mask_img, fold_intensity)
+        light_img = generate_lighting_overlay(img, mask_img)
+
+    else:
+        # Generic/other category fallback
+        # Define a centered zone (center 50% of the image)
+        mask_img = np.zeros((h_img, w_img), dtype=np.uint8)
+        z_w = int(w_img * 0.5)
+        z_h = int(h_img * 0.5)
+        z_x1 = (w_img - z_w) // 2
+        z_y1 = (h_img - z_h) // 2
+        z_x2 = z_x1 + z_w
+        z_y2 = z_y1 + z_h
+        cv2.rectangle(mask_img, (z_x1, z_y1), (z_x2, z_y2), 255, -1)
+        corners = [[z_x1, z_y1], [z_x2, z_y1], [z_x2, z_y2], [z_x1, z_y2]]
+
+        disp_img = np.ones((h_img, w_img), dtype=np.uint8) * 128
+        light_img = np.ones((h_img, w_img), dtype=np.uint8) * 128
+        fold_intensity = 0.0
+
+    # Write files
+    cv2.imwrite(os.path.join(target_dir, "mask.png"), mask_img)
+    cv2.imwrite(os.path.join(target_dir, "displacement.png"), disp_img)
+    cv2.imwrite(os.path.join(target_dir, "lighting.png"), light_img)
+
+    metadata = {
+        "id": template_id,
+        "category": category_clean,
+        "subtype": subtype_clean,
+        "label": label,
+        "base_image": "base.png",
+        "mask_image": "mask.png",
+        "displacement_image": "displacement.png",
+        "lighting_image": "lighting.png",
+        "design_zone_corners": corners,
+        "fold_intensity": fold_intensity,
+        "allow_rotation": True,
+        "rotation_limits_deg": [-15, 15],
+        "allow_perspective_adjust": True,
+        "recommended_design_resolution_px": [1500, 1500],
+        "min_upload_resolution_px": [400, 400],
+        "max_upload_resolution_px": [8000, 8000],
+        "supported_formats": ["png", "jpg", "webp"],
+        "export_default_format": "png",
+        "export_max_resolution_px": [4096, 4096],
+        "created_at": "2026-07-15",
+        "engine_version": "1.0"
+    }
+
+    metadata = convert_to_serializable(metadata)
+    # Ensure encoding="utf-8" explicitly as required by directives!
+    with open(os.path.join(target_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=4)
+
+    return metadata
+
+@app.delete("/api/history/{id}")
+def delete_render_history(id: int):
+    """
+    Deletes past render log from the SQLite database.
+    """
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM render_history WHERE id = ?", (id,))
+        conn.commit()
+        conn.close()
+        return {"status": "success", "message": f"History item {id} deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete history item: {str(e)}")
 
 # Fallback index endpoint to serve static frontend/index.html directly
 @app.get("/")
