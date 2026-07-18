@@ -33,9 +33,7 @@
             const [selectedTemplate, setSelectedTemplate] = useState(null);
             const [activeCategory, setActiveCategory] = useState("all");
             const [designImage, setDesignImage] = useState(null);
-            const [uploadedDesignId, setUploadedDesignId] = useState(null);
-            const [hasAlpha, setHasAlpha] = useState(true);
-            const [isRemovingBg, setIsRemovingBg] = useState(false);
+            const [designId, setDesignId] = useState(null);
             const [isRendering, setIsRendering] = useState(false);
             const [renderedOutput, setRenderedOutput] = useState(null);
             const [history, setHistory] = useState([]);
@@ -63,21 +61,16 @@
             const canvasRef = useRef(null);
             const fabricCanvas = useRef(null);
 
-            // Fetch templates on category change
+            // Fetch templates & history on mount
             useEffect(() => {
-                const url = activeCategory === "all" ? "/api/templates" : `/api/templates?category=${activeCategory}`;
-                fetch(url)
+                fetch("/api/templates")
                     .then(res => res.json())
                     .then(data => {
                         setTemplates(data);
-                        if (data.length > 0 && (!selectedTemplate || !data.some(t => t.id === selectedTemplate.id))) {
+                        if (data.length > 0) {
                             selectTemplate(data[0]);
                         }
                     });
-            }, [activeCategory]);
-
-            // Fetch history on mount
-            useEffect(() => {
                 fetchHistory();
             }, []);
 
@@ -85,12 +78,6 @@
                 fetch("/api/history")
                     .then(res => res.json())
                     .then(data => setHistory(data));
-            };
-
-            const deleteHistory = (id) => {
-                fetch(`/api/history/${id}`, { method: "DELETE" })
-                    .then(res => res.json())
-                    .then(() => fetchHistory());
             };
 
             const selectTemplate = (tpl) => {
@@ -195,6 +182,7 @@
                 const file = e.target.files[0];
                 if (!file) return;
 
+                // Upload file to get design_id
                 const formData = new FormData();
                 formData.append("file", file);
 
@@ -203,76 +191,100 @@
                     body: formData
                 })
                 .then(res => {
-                    if (!res.ok) {
-                        return res.json().then(err => { throw new Error(err.detail || "Upload failed") });
-                    }
+                    if (!res.ok) throw new Error("Failed to upload design to server");
                     return res.json();
                 })
                 .then(data => {
-                    setUploadedDesignId(data.design_id);
-                    setHasAlpha(data.has_alpha);
-
-                    const previewUrl = data.preview_url;
-                    setDesignImage(previewUrl);
-
-                    // Add to Fabric canvas
-                    loadDesignToCanvas(previewUrl);
+                    setDesignId(data.design_id);
                 })
                 .catch(err => {
-                    alert("Error uploading design: " + err.message);
+                    console.error("Design upload error:", err);
                 });
+
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    const b64Data = event.target.result;
+                    setDesignImage(b64Data);
+
+                    // Add to Fabric canvas
+                    fabric.Image.fromURL(b64Data, (img) => {
+                        const objects = fabricCanvas.current.getObjects();
+                        objects.forEach(obj => {
+                            if (obj.id === "user-design") {
+                                fabricCanvas.current.remove(obj);
+                            }
+                        });
+
+                        img.set({
+                            id: "user-design",
+                            left: fabricCanvas.current.width / 2,
+                            top: fabricCanvas.current.height / 2,
+                            originX: "center",
+                            originY: "center"
+                        });
+                        img.scaleToWidth(fabricCanvas.current.width * 0.35);
+
+                        fabricCanvas.current.add(img);
+                        fabricCanvas.current.setActiveObject(img);
+                        fabricCanvas.current.renderAll();
+
+                        setScale(img.scaleX);
+                        setRotation(img.angle);
+                    });
+                };
+                reader.readAsDataURL(file);
             };
 
-            const loadDesignToCanvas = (url) => {
-                fabric.Image.fromURL(url, (img) => {
-                    const objects = fabricCanvas.current.getObjects();
-                    objects.forEach(obj => {
-                        if (obj.id === "user-design") {
-                            fabricCanvas.current.remove(obj);
-                        }
-                    });
-
-                    img.set({
-                        id: "user-design",
-                        left: fabricCanvas.current.width / 2,
-                        top: fabricCanvas.current.height / 2,
-                        originX: "center",
-                        originY: "center"
-                    });
-                    img.scaleToWidth(fabricCanvas.current.width * 0.35);
-
-                    fabricCanvas.current.add(img);
-                    fabricCanvas.current.setActiveObject(img);
-                    fabricCanvas.current.renderAll();
-
-                    setScale(img.scaleX);
-                    setRotation(img.angle);
-                });
-            };
-
-            const handleRemoveBg = () => {
-                if (!uploadedDesignId) return;
-                setIsRemovingBg(true);
-
-                fetch(`/api/designs/${uploadedDesignId}/remove-bg`, {
+            const triggerBackgroundRemoval = () => {
+                if (!designId) {
+                    alert("Please wait for the design to finish uploading or try re-uploading.");
+                    return;
+                }
+                setIsRendering(true);
+                fetch(`/api/designs/${designId}/remove-bg`, {
                     method: "POST"
                 })
                 .then(res => {
                     if (!res.ok) {
-                        return res.json().then(err => { throw new Error(err.detail || "Background removal failed") });
+                        return res.json().then(err => { throw new Error(err.detail || "Failed to remove background") });
                     }
                     return res.json();
                 })
                 .then(data => {
-                    setHasAlpha(true);
-                    setIsRemovingBg(false);
-                    const freshUrl = data.preview_url + "?t=" + Date.now();
-                    setDesignImage(freshUrl);
-                    loadDesignToCanvas(freshUrl);
+                    setDesignImage(data.preview);
+                    // Replace design on canvas to match the background-removed version
+                    const canvasObj = fabricCanvas.current.getObjects().find(obj => obj.id === "user-design");
+                    let oldProps = {};
+                    if (canvasObj) {
+                        oldProps = {
+                            left: canvasObj.left,
+                            top: canvasObj.top,
+                            scaleX: canvasObj.scaleX,
+                            scaleY: canvasObj.scaleY,
+                            angle: canvasObj.angle
+                        };
+                        fabricCanvas.current.remove(canvasObj);
+                    }
+                    fabric.Image.fromURL(data.preview, (img) => {
+                        img.set({
+                            id: "user-design",
+                            left: oldProps.left || fabricCanvas.current.width / 2,
+                            top: oldProps.top || fabricCanvas.current.height / 2,
+                            scaleX: oldProps.scaleX || 1.0,
+                            scaleY: oldProps.scaleY || 1.0,
+                            angle: oldProps.angle || 0,
+                            originX: "center",
+                            originY: "center"
+                        });
+                        fabricCanvas.current.add(img);
+                        fabricCanvas.current.setActiveObject(img);
+                        fabricCanvas.current.renderAll();
+                    });
+                    setIsRendering(false);
                 })
                 .catch(err => {
-                    alert("Background removal error: " + err.message);
-                    setIsRemovingBg(false);
+                    alert("Error removing background: " + err.message);
+                    setIsRendering(false);
                 });
             };
 
@@ -295,7 +307,8 @@
 
                 const body = {
                     template_id: selectedTemplate.id,
-                    design_id: uploadedDesignId,
+                    design_base64: designId ? null : designImage,
+                    design_id: designId || null,
                     dst_corners: highResDstCorners,
                     blend_mode: blendMode,
                     color_correct: colorCorrect,
@@ -340,6 +353,16 @@
                 document.body.removeChild(link);
             };
 
+            const deleteHistoryItem = (id) => {
+                if (!confirm("Are you sure you want to delete this render log?")) return;
+                fetch(`/api/history/${id}`, { method: "DELETE" })
+                .then(res => {
+                    if (!res.ok) throw new Error("Failed to delete history item");
+                    fetchHistory();
+                })
+                .catch(err => alert("Error deleting history item: " + err.message));
+            };
+
             const categories = ["all", "apparel", "tech", "print"];
 
             return (
@@ -379,7 +402,9 @@
                                 </div>
 
                                 <div className="grid grid-cols-2 gap-3">
-                                    {templates.map(tpl => (
+                                    {templates
+                                        .filter(t => activeCategory === "all" || t.category === activeCategory)
+                                        .map(tpl => (
                                             <button
                                                 key={tpl.id}
                                                 onClick={() => selectTemplate(tpl)}
@@ -432,19 +457,13 @@
                                                 <p className="text-[10px] text-gray-400">Active on Canvas</p>
                                             </div>
                                         </div>
-
-                                        {/* Dynamic Auto Background Removal offer */}
-                                        {!hasAlpha && (
-                                            <div className="mt-1 p-2 bg-amber-50 border border-amber-200 rounded-md">
-                                                <p className="text-[11px] text-amber-800 mb-2 font-medium">This image appears to have no transparency layer (opaque background).</p>
-                                                <button
-                                                    onClick={handleRemoveBg}
-                                                    disabled={isRemovingBg}
-                                                    className="w-full py-1.5 px-3 bg-amber-600 hover:bg-amber-700 text-white font-semibold text-xs rounded transition-colors"
-                                                >
-                                                    {isRemovingBg ? "Removing Background..." : "Auto Background Removal"}
-                                                </button>
-                                            </div>
+                                        {designId && (
+                                            <button
+                                                onClick={triggerBackgroundRemoval}
+                                                className="w-full py-1.5 border border-blue-600 text-blue-600 hover:bg-blue-50 text-[11px] font-semibold rounded-lg transition-colors flex items-center justify-center gap-1"
+                                            >
+                                                ✨ Auto Background-Removal
+                                            </button>
                                         )}
                                     </div>
                                 )}
@@ -673,7 +692,7 @@
                                                 <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Format</th>
                                                 <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Resolution</th>
                                                 <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Timestamp</th>
-                                                <th className="px-6 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wider">Action</th>
+                                                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Action</th>
                                             </tr>
                                         </thead>
                                         <tbody className="bg-white divide-y divide-gray-100 text-xs text-gray-700">
@@ -683,10 +702,10 @@
                                                     <td className="px-6 py-4 uppercase font-semibold text-blue-600">{item.export_format}</td>
                                                     <td className="px-6 py-4">{item.width} x {item.height} px</td>
                                                     <td className="px-6 py-4 text-gray-400">{item.timestamp}</td>
-                                                    <td className="px-6 py-4 text-right">
+                                                    <td className="px-6 py-4">
                                                         <button
-                                                            onClick={() => deleteHistory(item.id)}
-                                                            className="text-red-600 hover:text-red-800 font-semibold"
+                                                            onClick={() => deleteHistoryItem(item.id)}
+                                                            className="text-red-600 hover:text-red-900 font-semibold transition-colors"
                                                         >
                                                             Delete
                                                         </button>

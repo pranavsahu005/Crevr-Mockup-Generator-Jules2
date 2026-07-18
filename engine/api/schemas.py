@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from typing import Optional, List, Dict, Any
 
 class TransformParams(BaseModel):
@@ -10,7 +10,7 @@ class TransformParams(BaseModel):
 class RenderRequest(BaseModel):
     template_id: str
     design_base64: Optional[str] = None  # Data URL or standard base64 string
-    design_id: Optional[str] = None     # Uploaded design ID
+    design_id: Optional[str] = None
     transform_params: Optional[TransformParams] = None
     dst_corners: Optional[List[List[float]]] = None  # High-res coordinates computed dynamically from client
     blend_mode: Optional[str] = "multiply"
@@ -20,6 +20,12 @@ class RenderRequest(BaseModel):
     export_format: Optional[str] = "png"
     dpi: Optional[int] = 300
     physical_size_mm: Optional[List[float]] = None
+
+    @model_validator(mode="after")
+    def check_design_provided(self) -> 'RenderRequest':
+        if not self.design_base64 and not self.design_id:
+            raise ValueError("Either design_base64 or design_id must be provided")
+        return self
 
 class RenderResponse(BaseModel):
     mockup_base64: str  # Returned as base64-encoded PNG/JPEG data
