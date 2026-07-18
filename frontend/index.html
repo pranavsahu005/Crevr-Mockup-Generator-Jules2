@@ -33,6 +33,7 @@
             const [selectedTemplate, setSelectedTemplate] = useState(null);
             const [activeCategory, setActiveCategory] = useState("all");
             const [designImage, setDesignImage] = useState(null);
+            const [designId, setDesignId] = useState(null);
             const [isRendering, setIsRendering] = useState(false);
             const [renderedOutput, setRenderedOutput] = useState(null);
             const [history, setHistory] = useState([]);
@@ -181,6 +182,25 @@
                 const file = e.target.files[0];
                 if (!file) return;
 
+                // Upload file to get design_id
+                const formData = new FormData();
+                formData.append("file", file);
+
+                fetch("/api/designs/upload", {
+                    method: "POST",
+                    body: formData
+                })
+                .then(res => {
+                    if (!res.ok) throw new Error("Failed to upload design to server");
+                    return res.json();
+                })
+                .then(data => {
+                    setDesignId(data.design_id);
+                })
+                .catch(err => {
+                    console.error("Design upload error:", err);
+                });
+
                 const reader = new FileReader();
                 reader.onload = (event) => {
                     const b64Data = event.target.result;
@@ -215,6 +235,59 @@
                 reader.readAsDataURL(file);
             };
 
+            const triggerBackgroundRemoval = () => {
+                if (!designId) {
+                    alert("Please wait for the design to finish uploading or try re-uploading.");
+                    return;
+                }
+                setIsRendering(true);
+                fetch(`/api/designs/${designId}/remove-bg`, {
+                    method: "POST"
+                })
+                .then(res => {
+                    if (!res.ok) {
+                        return res.json().then(err => { throw new Error(err.detail || "Failed to remove background") });
+                    }
+                    return res.json();
+                })
+                .then(data => {
+                    setDesignImage(data.preview);
+                    // Replace design on canvas to match the background-removed version
+                    const canvasObj = fabricCanvas.current.getObjects().find(obj => obj.id === "user-design");
+                    let oldProps = {};
+                    if (canvasObj) {
+                        oldProps = {
+                            left: canvasObj.left,
+                            top: canvasObj.top,
+                            scaleX: canvasObj.scaleX,
+                            scaleY: canvasObj.scaleY,
+                            angle: canvasObj.angle
+                        };
+                        fabricCanvas.current.remove(canvasObj);
+                    }
+                    fabric.Image.fromURL(data.preview, (img) => {
+                        img.set({
+                            id: "user-design",
+                            left: oldProps.left || fabricCanvas.current.width / 2,
+                            top: oldProps.top || fabricCanvas.current.height / 2,
+                            scaleX: oldProps.scaleX || 1.0,
+                            scaleY: oldProps.scaleY || 1.0,
+                            angle: oldProps.angle || 0,
+                            originX: "center",
+                            originY: "center"
+                        });
+                        fabricCanvas.current.add(img);
+                        fabricCanvas.current.setActiveObject(img);
+                        fabricCanvas.current.renderAll();
+                    });
+                    setIsRendering(false);
+                })
+                .catch(err => {
+                    alert("Error removing background: " + err.message);
+                    setIsRendering(false);
+                });
+            };
+
             const triggerRenderPipeline = () => {
                 if (!selectedTemplate || !designImage) {
                     alert("Please upload a custom design logo first.");
@@ -234,7 +307,8 @@
 
                 const body = {
                     template_id: selectedTemplate.id,
-                    design_base64: designImage,
+                    design_base64: designId ? null : designImage,
+                    design_id: designId || null,
                     dst_corners: highResDstCorners,
                     blend_mode: blendMode,
                     color_correct: colorCorrect,
@@ -277,6 +351,16 @@
                 document.body.appendChild(link);
                 link.click();
                 document.body.removeChild(link);
+            };
+
+            const deleteHistoryItem = (id) => {
+                if (!confirm("Are you sure you want to delete this render log?")) return;
+                fetch(`/api/history/${id}`, { method: "DELETE" })
+                .then(res => {
+                    if (!res.ok) throw new Error("Failed to delete history item");
+                    fetchHistory();
+                })
+                .catch(err => alert("Error deleting history item: " + err.message));
             };
 
             const categories = ["all", "apparel", "tech", "print"];
@@ -363,14 +447,24 @@
                                     <p className="mt-1 text-[10px] text-gray-400">Click or drag & drop</p>
                                 </div>
                                 {designImage && (
-                                    <div className="mt-4 p-2 bg-gray-50 border border-gray-200 rounded-lg flex items-center gap-3">
-                                        <div className="w-12 h-12 bg-white border border-gray-100 rounded overflow-hidden flex items-center justify-center">
-                                            <img src={designImage} alt="Uploaded logo" className="object-contain max-w-full max-h-full" />
+                                    <div className="mt-4 p-2 bg-gray-50 border border-gray-200 rounded-lg flex flex-col gap-3">
+                                        <div className="flex items-center gap-3">
+                                            <div className="w-12 h-12 bg-white border border-gray-100 rounded overflow-hidden flex items-center justify-center">
+                                                <img src={designImage} alt="Uploaded logo" className="object-contain max-w-full max-h-full" />
+                                            </div>
+                                            <div className="flex-1 min-w-0">
+                                                <p className="text-xs font-semibold text-gray-900 truncate">Design File Loaded</p>
+                                                <p className="text-[10px] text-gray-400">Active on Canvas</p>
+                                            </div>
                                         </div>
-                                        <div className="flex-1 min-w-0">
-                                            <p className="text-xs font-semibold text-gray-900 truncate">Design File Loaded</p>
-                                            <p className="text-[10px] text-gray-400">Active on Canvas</p>
-                                        </div>
+                                        {designId && (
+                                            <button
+                                                onClick={triggerBackgroundRemoval}
+                                                className="w-full py-1.5 border border-blue-600 text-blue-600 hover:bg-blue-50 text-[11px] font-semibold rounded-lg transition-colors flex items-center justify-center gap-1"
+                                            >
+                                                ✨ Auto Background-Removal
+                                            </button>
+                                        )}
                                     </div>
                                 )}
                             </div>
@@ -598,6 +692,7 @@
                                                 <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Format</th>
                                                 <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Resolution</th>
                                                 <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Timestamp</th>
+                                                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Action</th>
                                             </tr>
                                         </thead>
                                         <tbody className="bg-white divide-y divide-gray-100 text-xs text-gray-700">
@@ -607,6 +702,14 @@
                                                     <td className="px-6 py-4 uppercase font-semibold text-blue-600">{item.export_format}</td>
                                                     <td className="px-6 py-4">{item.width} x {item.height} px</td>
                                                     <td className="px-6 py-4 text-gray-400">{item.timestamp}</td>
+                                                    <td className="px-6 py-4">
+                                                        <button
+                                                            onClick={() => deleteHistoryItem(item.id)}
+                                                            className="text-red-600 hover:text-red-900 font-semibold transition-colors"
+                                                        >
+                                                            Delete
+                                                        </button>
+                                                    </td>
                                                 </tr>
                                             ))}
                                         </tbody>
