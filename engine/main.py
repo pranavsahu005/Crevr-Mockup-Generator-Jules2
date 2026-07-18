@@ -5,6 +5,9 @@ import base64
 import cv2
 import numpy as np
 import sqlite3
+import uuid
+import io
+from PIL import Image
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -30,9 +33,11 @@ app.add_middleware(
 )
 
 DATABASE_PATH = "data/crevr.db"
+UPLOADS_DIR = "data/uploads"
 
 def init_db():
     os.makedirs("data", exist_ok=True)
+    os.makedirs("data/uploads", exist_ok=True)
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
     cursor.execute("""
@@ -145,10 +150,22 @@ def render_mockup(req: RenderRequest):
     dst_corners = req.dst_corners if req.dst_corners is not None else meta.get("design_zone_corners")
 
     # Decode user's custom design image
-    try:
-        design_img = decode_base64_image(req.design_base64)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to decode design image: {str(e)}")
+    if req.design_base64 is not None:
+        try:
+            design_img = decode_base64_image(req.design_base64)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to decode design image: {str(e)}")
+    elif req.design_id is not None:
+        if not re.match(r"^[a-zA-Z0-9_-]+$", req.design_id):
+            raise HTTPException(status_code=400, detail="Invalid design ID format")
+        secure_filepath = os.path.join(UPLOADS_DIR, f"{req.design_id}.png")
+        if not os.path.exists(secure_filepath):
+            raise HTTPException(status_code=404, detail="Design not found")
+        design_img = cv2.imread(secure_filepath, cv2.IMREAD_UNCHANGED)
+        if design_img is None:
+            raise HTTPException(status_code=400, detail="Could not read design image from disk")
+    else:
+        raise HTTPException(status_code=400, detail="Either design_base64 or design_id must be provided")
 
     h_ds, w_ds = design_img.shape[:2]
     src_corners = [[0, 0], [w_ds, 0], [w_ds, h_ds], [0, h_ds]]
@@ -248,6 +265,129 @@ def get_render_history():
     history = [dict(row) for row in rows]
     conn.close()
     return history
+
+@app.post("/api/designs/upload")
+async def upload_design(file: UploadFile = File(...)):
+    # 1. Size constraint: 25MB max
+    contents = await file.read()
+    if len(contents) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File size exceeds maximum allowed limit of 25MB")
+
+    # 2. Decompression-bomb and resolution constraint (max 8000x8000)
+    try:
+        img_pil = Image.open(io.BytesIO(contents))
+        img_pil.verify()  # Verify valid image structure
+        # Re-open to actually parse and manipulate
+        img_pil = Image.open(io.BytesIO(contents))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid image or corrupted bytes")
+
+    w, h = img_pil.size
+    if w > 8000 or h > 8000:
+        raise HTTPException(status_code=400, detail="Image resolution exceeds maximum allowed limit of 8000x8000")
+
+    # 3. Strip EXIF/metadata and sanitize (re-save to PNG)
+    sanitized_io = io.BytesIO()
+    try:
+        # If palette-based, convert to RGBA
+        if img_pil.mode in ("P", "1", "CMYK"):
+            img_pil = img_pil.convert("RGBA")
+        img_pil.save(sanitized_io, format="PNG")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sanitization failed: {str(e)}")
+
+    # 4. Save securely with random UUID filename
+    design_id = str(uuid.uuid4())
+    secure_filename = f"{design_id}.png"
+    secure_filepath = os.path.join(UPLOADS_DIR, secure_filename)
+
+    with open(secure_filepath, "wb") as out_f:
+        out_f.write(sanitized_io.getvalue())
+
+    return {"design_id": design_id, "width": w, "height": h}
+
+@app.post("/api/designs/{design_id}/remove-bg")
+def remove_bg(design_id: str):
+    # Path traversal protection
+    if not re.match(r"^[a-zA-Z0-9_-]+$", design_id):
+        raise HTTPException(status_code=400, detail="Invalid design ID format")
+
+    secure_filepath = os.path.join(UPLOADS_DIR, f"{design_id}.png")
+    if not os.path.exists(secure_filepath):
+        raise HTTPException(status_code=404, detail="Design not found")
+
+    # Load image using OpenCV
+    img = cv2.imread(secure_filepath, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Could not load design image")
+
+    h, w = img.shape[:2]
+
+    # Ensure image has alpha channel (BGRA)
+    if len(img.shape) == 2:  # Grayscale
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+    elif img.shape[2] == 3:  # BGR
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+
+    # Make a copy of BGR channels for floodFill
+    bgr = img[:, :, :3].copy()
+
+    # Prepare floodfill mask (h+2, w+2) initialized to 0
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+
+    # Run flood fill starting from the four corners
+    corners = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+    for pt in corners:
+        if pt[0] < w and pt[1] < h:
+            cv2.floodFill(
+                bgr,
+                flood_mask,
+                pt,
+                newVal=255,
+                loDiff=(10, 10, 10),
+                upDiff=(10, 10, 10),
+                flags=cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+            )
+
+    filled_mask = flood_mask[1:-1, 1:-1]
+
+    # Set matching pixels to transparent
+    img[filled_mask == 255, 3] = 0
+
+    # Save back
+    cv2.imwrite(secure_filepath, img)
+
+    return {"status": "success", "design_id": design_id}
+
+@app.get("/api/designs/{design_id}")
+def get_design_image(design_id: str):
+    if not re.match(r"^[a-zA-Z0-9_-]+$", design_id):
+        raise HTTPException(status_code=400, detail="Invalid design ID format")
+    secure_filepath = os.path.join(UPLOADS_DIR, f"{design_id}.png")
+    if not os.path.exists(secure_filepath):
+        raise HTTPException(status_code=404, detail="Design not found")
+    return FileResponse(secure_filepath, media_type="image/png")
+
+@app.post("/api/templates/ingest")
+def trigger_ingest():
+    from engine.pipeline.ingest import ingest_all_templates
+    try:
+        ingest_all_templates()
+        return {"status": "success", "message": "All templates ingested successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
+
+@app.delete("/api/history/{history_id}")
+def delete_history_item(history_id: int):
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM render_history WHERE id = ?", (history_id,))
+        conn.commit()
+        conn.close()
+        return {"status": "success", "message": f"History item {history_id} deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete history item: {str(e)}")
 
 # Fallback index endpoint to serve static frontend/index.html directly
 @app.get("/")

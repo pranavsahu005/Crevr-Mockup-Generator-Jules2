@@ -33,7 +33,10 @@
             const [selectedTemplate, setSelectedTemplate] = useState(null);
             const [activeCategory, setActiveCategory] = useState("all");
             const [designImage, setDesignImage] = useState(null);
+            const [designId, setDesignId] = useState(null);
             const [isRendering, setIsRendering] = useState(false);
+            const [isRemovingBg, setIsRemovingBg] = useState(false);
+            const [isIngesting, setIsIngesting] = useState(false);
             const [renderedOutput, setRenderedOutput] = useState(null);
             const [history, setHistory] = useState([]);
 
@@ -181,6 +184,25 @@
                 const file = e.target.files[0];
                 if (!file) return;
 
+                // Upload to backend
+                const formData = new FormData();
+                formData.append("file", file);
+
+                fetch("/api/designs/upload", {
+                    method: "POST",
+                    body: formData
+                })
+                .then(res => {
+                    if (!res.ok) throw new Error("Upload failed");
+                    return res.json();
+                })
+                .then(data => {
+                    setDesignId(data.design_id);
+                })
+                .catch(err => {
+                    console.error("Failed to upload design file to server:", err);
+                });
+
                 const reader = new FileReader();
                 reader.onload = (event) => {
                     const b64Data = event.target.result;
@@ -215,6 +237,78 @@
                 reader.readAsDataURL(file);
             };
 
+            const triggerRemoveBg = () => {
+                if (!designId) {
+                    alert("Please upload a design first.");
+                    return;
+                }
+                setIsRemovingBg(true);
+                fetch(`/api/designs/${designId}/remove-bg`, {
+                    method: "POST"
+                })
+                .then(res => {
+                    if (!res.ok) throw new Error("Background removal failed");
+                    return res.json();
+                })
+                .then(data => {
+                    const updatedImageUrl = `/api/designs/${designId}?t=${Date.now()}`;
+                    setDesignImage(updatedImageUrl);
+
+                    // Update image on Fabric canvas
+                    const activeObj = fabricCanvas.current.getObjects().find(obj => obj.id === "user-design");
+                    if (activeObj) {
+                        fabric.Image.fromURL(updatedImageUrl, (img) => {
+                            activeObj.setElement(img.getElement());
+                            fabricCanvas.current.renderAll();
+                        });
+                    }
+                    setIsRemovingBg(false);
+                })
+                .catch(err => {
+                    alert("Error removing background: " + err.message);
+                    setIsRemovingBg(false);
+                });
+            };
+
+            const triggerIngest = () => {
+                setIsIngesting(true);
+                fetch("/api/templates/ingest", {
+                    method: "POST"
+                })
+                .then(res => {
+                    if (!res.ok) throw new Error("Ingestion failed");
+                    return res.json();
+                })
+                .then(data => {
+                    alert("Templates ingested successfully!");
+                    setIsIngesting(false);
+                    fetch("/api/templates")
+                        .then(res => res.json())
+                        .then(data => setTemplates(data));
+                })
+                .catch(err => {
+                    alert("Error ingesting templates: " + err.message);
+                    setIsIngesting(false);
+                });
+            };
+
+            const deleteHistoryItem = (historyId) => {
+                if (!confirm("Are you sure you want to delete this rendering job history?")) return;
+                fetch(`/api/history/${historyId}`, {
+                    method: "DELETE"
+                })
+                .then(res => {
+                    if (!res.ok) throw new Error("Failed to delete history item");
+                    return res.json();
+                })
+                .then(data => {
+                    fetchHistory();
+                })
+                .catch(err => {
+                    alert("Error deleting history item: " + err.message);
+                });
+            };
+
             const triggerRenderPipeline = () => {
                 if (!selectedTemplate || !designImage) {
                     alert("Please upload a custom design logo first.");
@@ -234,7 +328,8 @@
 
                 const body = {
                     template_id: selectedTemplate.id,
-                    design_base64: designImage,
+                    design_base64: designImage && designImage.startsWith("data:") ? designImage : null,
+                    design_id: designId,
                     dst_corners: highResDstCorners,
                     blend_mode: blendMode,
                     color_correct: colorCorrect,
@@ -290,6 +385,14 @@
                             <span className="bg-blue-100 text-blue-800 text-xs font-medium px-2.5 py-0.5 rounded">Deterministic CV Engine</span>
                         </div>
                         <div className="flex items-center gap-6">
+                            <button
+                                onClick={triggerIngest}
+                                disabled={isIngesting}
+                                className="text-xs font-semibold px-2.5 py-1 rounded bg-slate-100 text-slate-700 border border-slate-200 hover:bg-slate-200 transition-colors disabled:opacity-50"
+                            >
+                                {isIngesting ? "Ingesting..." : "Ingest Templates"}
+                            </button>
+                            <span className="text-gray-300">|</span>
                             <a href="#history" className="text-sm font-medium text-gray-600 hover:text-gray-900">History</a>
                             <span className="text-gray-300">|</span>
                             <div className="text-sm font-semibold text-gray-700">Production Mode</div>
@@ -363,14 +466,34 @@
                                     <p className="mt-1 text-[10px] text-gray-400">Click or drag & drop</p>
                                 </div>
                                 {designImage && (
-                                    <div className="mt-4 p-2 bg-gray-50 border border-gray-200 rounded-lg flex items-center gap-3">
-                                        <div className="w-12 h-12 bg-white border border-gray-100 rounded overflow-hidden flex items-center justify-center">
-                                            <img src={designImage} alt="Uploaded logo" className="object-contain max-w-full max-h-full" />
+                                    <div className="mt-4">
+                                        <div className="p-2 bg-gray-50 border border-gray-200 rounded-lg flex items-center gap-3">
+                                            <div className="w-12 h-12 bg-white border border-gray-100 rounded overflow-hidden flex items-center justify-center">
+                                                <img src={designImage} alt="Uploaded logo" className="object-contain max-w-full max-h-full" />
+                                            </div>
+                                            <div className="flex-1 min-w-0">
+                                                <p className="text-xs font-semibold text-gray-900 truncate">Design File Loaded</p>
+                                                <p className="text-[10px] text-gray-400">Active on Canvas</p>
+                                            </div>
                                         </div>
-                                        <div className="flex-1 min-w-0">
-                                            <p className="text-xs font-semibold text-gray-900 truncate">Design File Loaded</p>
-                                            <p className="text-[10px] text-gray-400">Active on Canvas</p>
-                                        </div>
+                                        <button
+                                            onClick={triggerRemoveBg}
+                                            disabled={isRemovingBg || !designId}
+                                            className={`w-full mt-3 py-2 text-xs font-semibold rounded-lg border transition-colors flex items-center justify-center gap-2 ${
+                                                designId
+                                                    ? "bg-white hover:bg-slate-50 border-slate-300 text-slate-700"
+                                                    : "bg-gray-100 text-gray-400 border-transparent cursor-not-allowed"
+                                            }`}
+                                        >
+                                            {isRemovingBg ? (
+                                                <span className="flex items-center gap-2">
+                                                    <span className="animate-spin rounded-full h-3.5 w-3.5 border-b-2 border-slate-600"></span>
+                                                    Removing BG...
+                                                </span>
+                                            ) : (
+                                                "Remove Background (Flood-Fill)"
+                                            )}
+                                        </button>
                                     </div>
                                 )}
                             </div>
@@ -598,6 +721,7 @@
                                                 <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Format</th>
                                                 <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Resolution</th>
                                                 <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Timestamp</th>
+                                                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Actions</th>
                                             </tr>
                                         </thead>
                                         <tbody className="bg-white divide-y divide-gray-100 text-xs text-gray-700">
@@ -607,6 +731,14 @@
                                                     <td className="px-6 py-4 uppercase font-semibold text-blue-600">{item.export_format}</td>
                                                     <td className="px-6 py-4">{item.width} x {item.height} px</td>
                                                     <td className="px-6 py-4 text-gray-400">{item.timestamp}</td>
+                                                    <td className="px-6 py-4">
+                                                        <button
+                                                            onClick={() => deleteHistoryItem(item.id)}
+                                                            className="text-red-600 hover:text-red-800 font-semibold transition-colors focus:outline-none"
+                                                        >
+                                                            Delete
+                                                        </button>
+                                                    </td>
                                                 </tr>
                                             ))}
                                         </tbody>
