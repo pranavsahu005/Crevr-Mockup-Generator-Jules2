@@ -148,7 +148,7 @@ def ingest_all_templates():
     }
 
     metadata_l = convert_to_serializable(metadata_l)
-    with open("templates/laptop_01/metadata.json", "w") as f:
+    with open("templates/laptop_01/metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata_l, f, indent=4)
 
     print("Ingesting tshirt_01...")
@@ -215,7 +215,7 @@ def ingest_all_templates():
         "engine_version": "1.0"
     }
     metadata_t1 = convert_to_serializable(metadata_t1)
-    with open("templates/tshirt_01/metadata.json", "w") as f:
+    with open("templates/tshirt_01/metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata_t1, f, indent=4)
 
     print("Ingesting tshirt_02...")
@@ -276,7 +276,7 @@ def ingest_all_templates():
         "engine_version": "1.0"
     }
     metadata_t2 = convert_to_serializable(metadata_t2)
-    with open("templates/tshirt_02/metadata.json", "w") as f:
+    with open("templates/tshirt_02/metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata_t2, f, indent=4)
 
     print("Ingestion complete.")
