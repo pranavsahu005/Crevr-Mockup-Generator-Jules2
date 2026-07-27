@@ -74,3 +74,19 @@ def test_export_dimensions():
     # Test millimeter to pixel DPI conversion
     dims = calculate_export_dimensions((101.6, 152.4), 300) # 4x6 inches at 300 DPI
     assert dims == (1200, 1800)
+
+def test_linear_blend_mathematical_difference():
+    # Test that linear blending operates differently than standard sRGB blending
+    # Create foreground with midtone colors and background with a gradient or distinct values
+    foreground = np.ones((10, 10, 4), dtype=np.uint8) * 128
+    background = np.ones((10, 10, 3), dtype=np.uint8) * 180
+    # A midtone feathered mask
+    feathered_mask = np.ones((10, 10), dtype=np.float32) * 0.5
+
+    srgb_blended = blend_with_alpha_mask(foreground, background, feathered_mask, linear_blend=False)
+    linear_blended = blend_with_alpha_mask(foreground, background, feathered_mask, linear_blend=True)
+
+    # They should not be identical because linear blend performs gamma space conversion
+    assert not np.array_equal(srgb_blended, linear_blended)
+    # Check shape is correct
+    assert linear_blended.shape == (10, 10, 3)
