@@ -83,9 +83,10 @@ def health_check():
     return {"status": "healthy", "engine": "Crevr Mockup Engine v1.0"}
 
 @app.get("/api/templates")
-def list_templates():
+def list_templates(category: Optional[str] = None):
     """
     Lists all ingested and ready-to-use mockup templates on disk.
+    Allows optional filtering by category (case-insensitive).
     """
     templates_dir = "templates"
     if not os.path.exists(templates_dir):
@@ -100,11 +101,29 @@ def list_templates():
             if os.path.exists(meta_path):
                 with open(meta_path, "r", encoding="utf-8") as f:
                     meta = json.load(f)
+                    # Support category filtering
+                    if category:
+                        meta_cat = meta.get("category", "")
+                        if meta_cat.lower() != category.lower():
+                            continue
                     templates.append(meta)
         except Exception as e:
             # Skip invalid or unauthorized directories
             continue
     return templates
+
+from pydantic import BaseModel
+
+class TemplateFilterRequest(BaseModel):
+    category: Optional[str] = None
+
+@app.post("/api/templates")
+def list_templates_post(req: TemplateFilterRequest):
+    """
+    Lists all ingested and ready-to-use mockup templates on disk.
+    Supports category filtering in the JSON request body.
+    """
+    return list_templates(category=req.category)
 
 @app.get("/api/templates/{template_id}")
 def get_template_by_id(template_id: str):
@@ -117,6 +136,8 @@ def get_template_by_id(template_id: str):
 
 def decode_base64_image(b64_str: str) -> np.ndarray:
     """Decodes base64 string (including Data URL scheme) to OpenCV BGR/BGRA array."""
+    if len(b64_str) > 35 * 1024 * 1024:
+        raise ValueError("Base64 payload exceeds security limit of 25MB")
     if "," in b64_str:
         b64_str = b64_str.split(",")[1]
     img_bytes = base64.b64decode(b64_str)
@@ -124,6 +145,9 @@ def decode_base64_image(b64_str: str) -> np.ndarray:
     img = cv2.imdecode(np_arr, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError("Invalid image or corrupted bytes")
+    h, w = img.shape[:2]
+    if w > 8000 or h > 8000:
+        raise ValueError("Image resolution exceeds the 8000x8000 limit")
     return img
 
 @app.post("/api/render", response_model=RenderResponse)
@@ -181,6 +205,50 @@ def render_mockup(req: RenderRequest):
             "offset_y": req.transform_params.offset_y
         }
 
+    # Collect warnings before and during the pipeline processing
+    warnings = []
+
+    # 1. Check missing transparency (for apparel/t-shirt designs)
+    is_design_opaque = True
+    if len(design_img.shape) == 3 and design_img.shape[2] == 4:
+        alpha_channel = design_img[:, :, 3]
+        min_alpha = np.min(alpha_channel)
+        if min_alpha < 255:
+            is_design_opaque = False
+    elif len(design_img.shape) == 2:
+        is_design_opaque = True
+    else:
+        is_design_opaque = True
+
+    category_clean = meta.get("category", "").lower().strip()
+    subtype_clean = meta.get("subtype", "").lower().strip()
+    if is_design_opaque and (category_clean == "apparel" or subtype_clean == "t-shirt"):
+        warnings.append("The design has no transparency on an apparel template. Consider background removal.")
+
+    # 2. Check upscaling (if design is smaller than destination area bounding box or min resolutions)
+    target_up_warn = False
+    if dst_corners and len(dst_corners) == 4:
+        xs = [pt[0] for pt in dst_corners]
+        ys = [pt[1] for pt in dst_corners]
+        bbox_w = max(xs) - min(xs)
+        bbox_h = max(ys) - min(ys)
+        if w_ds < bbox_w or h_ds < bbox_h:
+            target_up_warn = True
+
+    min_res = meta.get("min_upload_resolution_px", [0, 0])
+    if w_ds < min_res[0] or h_ds < min_res[1] or target_up_warn:
+        warnings.append("The uploaded design resolution is smaller than the target placement area, resulting in upscaling.")
+
+    # 3. Check clamping (if requested custom dimensions exceed export max resolution limits)
+    if req.physical_size_mm and len(req.physical_size_mm) == 2:
+        export_w_raw, export_h_raw = calculate_export_dimensions(
+            (req.physical_size_mm[0], req.physical_size_mm[1]),
+            req.dpi
+        )
+        max_res = meta.get("export_max_resolution_px", [4000, 4000])
+        if export_w_raw > max_res[0] or export_h_raw > max_res[1]:
+            warnings.append("The requested print resolution exceeds the maximum allowed export dimensions and was clamped.")
+
     # Process through pipeline
     try:
         composite = render_mockup_pipeline(
@@ -195,7 +263,8 @@ def render_mockup(req: RenderRequest):
             feather_radius=req.feather_radius,
             blend_mode=req.blend_mode,
             color_correct=req.color_correct,
-            transform_params=t_params
+            transform_params=t_params,
+            linear_blend=req.linear_blend
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Render pipeline failed: {str(e)}")
@@ -250,7 +319,8 @@ def render_mockup(req: RenderRequest):
         mockup_base64=data_url,
         format=req.export_format,
         width=w_out,
-        height=h_out
+        height=h_out,
+        warnings=warnings if warnings else None
     )
 
 @app.get("/api/history")
@@ -311,6 +381,16 @@ async def upload_design(file: UploadFile = File(...)):
 
     img, mime_type = sniff_and_sanitize_image(file_bytes)
 
+    is_opaque = True
+    if img.mode == "RGBA":
+        extrema = img.getchannel("A").getextrema()
+        if extrema and extrema[0] < 255:
+            is_opaque = False
+    elif img.mode == "LA":
+        extrema = img.getchannel("A").getextrema()
+        if extrema and extrema[0] < 255:
+            is_opaque = False
+
     # Convert to RGBA to preserve transparency if it exists or if we save as PNG
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGBA")
@@ -335,7 +415,8 @@ async def upload_design(file: UploadFile = File(...)):
 
     return {
         "design_id": upload_id,
-        "preview": preview_url
+        "preview": preview_url,
+        "prompt_bg_removal": is_opaque
     }
 
 def validate_design_id(design_id: str) -> str:
