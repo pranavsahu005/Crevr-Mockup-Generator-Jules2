@@ -143,3 +143,75 @@ def test_template_ingest_apparel():
 
     # Cleanup ingested template directory
     shutil.rmtree("templates/test_tshirt_ingested", ignore_errors=True)
+
+def test_template_category_filtering():
+    # Test GET template category filtering
+    get_res = client.get("/api/templates?category=tech")
+    assert get_res.status_code == 200
+    templates_get = get_res.json()
+    for t in templates_get:
+        assert t["category"] == "tech"
+
+    # Test POST template category filtering
+    post_res = client.post("/api/templates", json={"category": "apparel"})
+    assert post_res.status_code == 200
+    templates_post = post_res.json()
+    for t in templates_post:
+        assert t["category"] == "apparel"
+
+def test_upload_prompt_bg_removal():
+    # Fully opaque image should prompt for background removal
+    opaque_bytes = create_dummy_image(100, 100, color=(255, 0, 0, 255))
+    res = client.post(
+        "/api/designs/upload",
+        files={"file": ("opaque.png", opaque_bytes, "image/png")}
+    )
+    assert res.status_code == 200
+    assert res.json()["prompt_bg_removal"] is True
+
+    # Image with transparent background should not prompt
+    transparent_bytes = create_dummy_image(100, 100, color=(255, 0, 0, 100))
+    res2 = client.post(
+        "/api/designs/upload",
+        files={"file": ("transparent.png", transparent_bytes, "image/png")}
+    )
+    assert res2.status_code == 200
+    assert res2.json()["prompt_bg_removal"] is False
+
+def test_render_warnings():
+    # Upload an opaque and small design to trigger warnings when rendering on apparel
+    opaque_small_bytes = create_dummy_image(10, 10, color=(255, 255, 255, 255))
+    upload_res = client.post(
+        "/api/designs/upload",
+        files={"file": ("small.png", opaque_small_bytes, "image/png")}
+    )
+    design_id = upload_res.json()["design_id"]
+
+    # Render with custom physical size that forces clamping
+    render_payload = {
+        "template_id": "tshirt_01",
+        "design_id": design_id,
+        "physical_size_mm": [9999.0, 9999.0], # massive physical size
+        "dpi": 600
+    }
+    render_res = client.post("/api/render", json=render_payload)
+    assert render_res.status_code == 200
+    data = render_res.json()
+    assert "warnings" in data
+    warnings = data["warnings"]
+    assert warnings is not None
+    # Should have upscaling and missing transparency and clamping warnings
+    assert any("transparency" in w for w in warnings)
+    assert any("upscaling" in w for w in warnings)
+    assert any("clamped" in w for w in warnings)
+
+def test_render_base64_decompression_bomb_limits():
+    # Test base64 payload length security validation
+    huge_payload = "a" * (36 * 1024 * 1024)
+    render_payload = {
+        "template_id": "tshirt_01",
+        "design_base64": huge_payload
+    }
+    render_res = client.post("/api/render", json=render_payload)
+    assert render_res.status_code == 400
+    assert "exceeds" in render_res.json()["detail"]
