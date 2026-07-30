@@ -143,3 +143,95 @@ def test_template_ingest_apparel():
 
     # Cleanup ingested template directory
     shutil.rmtree("templates/test_tshirt_ingested", ignore_errors=True)
+
+def test_upload_opaque_check():
+    # 1. Upload fully opaque image
+    opaque_bytes = create_dummy_image(100, 100, color=(255, 0, 0, 255))
+    res_opaque = client.post(
+        "/api/designs/upload",
+        files={"file": ("opaque.png", opaque_bytes, "image/png")}
+    )
+    assert res_opaque.status_code == 200
+    assert res_opaque.json()["prompt_bg_removal"] is True
+
+    # 2. Upload transparent image
+    transparent_bytes = create_dummy_image(100, 100, color=(255, 0, 0, 0))
+    res_transparent = client.post(
+        "/api/designs/upload",
+        files={"file": ("transparent.png", transparent_bytes, "image/png")}
+    )
+    assert res_transparent.status_code == 200
+    assert res_transparent.json()["prompt_bg_removal"] is False
+
+def test_category_filtering():
+    # 1. GET request with category query param
+    res_apparel = client.get("/api/templates?category=apparel")
+    assert res_apparel.status_code == 200
+    for tpl in res_apparel.json():
+        assert tpl["category"] == "apparel"
+
+    res_tech = client.get("/api/templates?category=tech")
+    assert res_tech.status_code == 200
+    for tpl in res_tech.json():
+        assert tpl["category"] == "tech"
+
+    # 2. POST request with JSON body
+    res_post_tech = client.post("/api/templates", json={"category": "tech"})
+    assert res_post_tech.status_code == 200
+    for tpl in res_post_tech.json():
+        assert tpl["category"] == "tech"
+
+def test_render_warnings():
+    # 1. Test missing transparency on apparel template
+    opaque_bytes = create_dummy_image(100, 100, color=(0, 255, 0, 255))
+    upload_res = client.post(
+        "/api/designs/upload",
+        files={"file": ("opaque_design.png", opaque_bytes, "image/png")}
+    )
+    design_id = upload_res.json()["design_id"]
+
+    render_payload = {
+        "template_id": "tshirt_01",
+        "design_id": design_id,
+        "blend_mode": "multiply",
+        "color_correct": False,
+        "feather_radius": 3
+    }
+    render_res = client.post("/api/render", json=render_payload)
+    assert render_res.status_code == 200
+    data = render_res.json()
+    assert any("Missing transparency on apparel template" in w for w in data["warnings"])
+
+    # 2. Test upscaling warning
+    small_bytes = create_dummy_image(10, 10, color=(0, 255, 0, 255))
+    upload_small_res = client.post(
+        "/api/designs/upload",
+        files={"file": ("small_design.png", small_bytes, "image/png")}
+    )
+    small_design_id = upload_small_res.json()["design_id"]
+    render_payload_small = {
+        "template_id": "tshirt_01",
+        "design_id": small_design_id,
+        "blend_mode": "multiply",
+        "color_correct": False,
+        "feather_radius": 3
+    }
+    render_res_small = client.post("/api/render", json=render_payload_small)
+    assert render_res_small.status_code == 200
+    data_small = render_res_small.json()
+    assert any("Upscaling warning" in w for w in data_small["warnings"])
+
+    # 3. Test output resolution clamping warning
+    clamped_payload = {
+        "template_id": "tshirt_01",
+        "design_id": design_id,
+        "blend_mode": "multiply",
+        "color_correct": False,
+        "feather_radius": 3,
+        "physical_size_mm": [500.0, 500.0],
+        "dpi": 300  # 500 mm / 25.4 * 300 ≈ 5905 px, exceeds tshirt_01 max resolution of 2000 px
+    }
+    render_clamped_res = client.post("/api/render", json=clamped_payload)
+    assert render_clamped_res.status_code == 200
+    data_clamped = render_clamped_res.json()
+    assert any("clamped to template's maximum limit" in w for w in data_clamped["warnings"])
