@@ -83,6 +83,23 @@ def test_remove_background():
     traversal_res = client.post("/api/designs/../remove-bg")
     assert traversal_res.status_code == 404 # route not matching or invalid
 
+def test_upload_design_transparency():
+    # Check that fully opaque returns prompt_bg_removal = True
+    img_opaque = create_dummy_image(100, 100, color=(255, 0, 0, 255))
+    res_opaque = client.post(
+        "/api/designs/upload",
+        files={"file": ("opaque.png", img_opaque, "image/png")}
+    )
+    assert res_opaque.json()["prompt_bg_removal"] is True
+
+    # Check that transparent returns prompt_bg_removal = False
+    img_trans = create_dummy_image(100, 100, color=(0, 0, 0, 0))
+    res_trans = client.post(
+        "/api/designs/upload",
+        files={"file": ("trans.png", img_trans, "image/png")}
+    )
+    assert res_trans.json()["prompt_bg_removal"] is False
+
 def test_render_using_uploaded_id():
     # Upload design first
     img_bytes = create_dummy_image(100, 100, color=(0, 255, 0, 255))
@@ -98,13 +115,43 @@ def test_render_using_uploaded_id():
         "design_id": design_id,
         "blend_mode": "multiply",
         "color_correct": False,
-        "feather_radius": 3
+        "feather_radius": 3,
+        "linear_blend": True
     }
     render_res = client.post("/api/render", json=render_payload)
     assert render_res.status_code == 200
     data = render_res.json()
     assert "mockup_base64" in data
     assert data["format"] == "png"
+    # This design is 100x100 (smaller than tshirt_01 recommended 1200x1200) -> upscaling warning
+    # Also fully opaque on apparel template -> missing_transparency warning
+    assert "upscaling" in data["warnings"]
+    assert "missing_transparency" in data["warnings"]
+
+def test_render_warnings_clamped():
+    img_bytes = create_dummy_image(500, 500, color=(0, 255, 0, 0)) # transparent
+    upload_res = client.post(
+        "/api/designs/upload",
+        files={"file": ("design_clamped.png", img_bytes, "image/png")}
+    )
+    design_id = upload_res.json()["design_id"]
+
+    # Trigger render with huge physical size and high DPI -> resolution_clamped warning
+    render_payload = {
+        "template_id": "tshirt_01",
+        "design_id": design_id,
+        "physical_size_mm": [1000.0, 1000.0],
+        "dpi": 600
+    }
+    render_res = client.post("/api/render", json=render_payload)
+    assert render_res.status_code == 200
+    data = render_res.json()
+    # Recommended resolution of tshirt_01 is 1200x1200px. Design is 500x500px -> upscaling warning.
+    # physical_size (1000mm = 39.37in) * 600 DPI = 23622px > export_max_resolution_px (2000px) -> resolution_clamped warning
+    # No missing_transparency because design is transparent
+    assert "upscaling" in data["warnings"]
+    assert "resolution_clamped" in data["warnings"]
+    assert "missing_transparency" not in data["warnings"]
 
 def test_delete_history():
     # Fetch history first to check count or entries
