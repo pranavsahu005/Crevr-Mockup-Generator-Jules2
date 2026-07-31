@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
 from typing import Optional, List
 
-from engine.api.schemas import RenderRequest, RenderResponse, TransformParams
+from engine.api.schemas import RenderRequest, RenderResponse, TransformParams, TemplateFilterRequest
 from engine.pipeline.render import render_mockup_pipeline, calculate_export_dimensions
 from engine.pipeline.ingest import generate_lighting_overlay, generate_displacement_map, convert_to_serializable
 
@@ -83,9 +83,10 @@ def health_check():
     return {"status": "healthy", "engine": "Crevr Mockup Engine v1.0"}
 
 @app.get("/api/templates")
-def list_templates():
+def list_templates(category: Optional[str] = None):
     """
     Lists all ingested and ready-to-use mockup templates on disk.
+    Supports optional category query parameter for filtering.
     """
     templates_dir = "templates"
     if not os.path.exists(templates_dir):
@@ -100,11 +101,25 @@ def list_templates():
             if os.path.exists(meta_path):
                 with open(meta_path, "r", encoding="utf-8") as f:
                     meta = json.load(f)
-                    templates.append(meta)
+
+                    if category:
+                        # Case-insensitive category comparison
+                        if meta.get("category", "").lower() == category.lower():
+                            templates.append(meta)
+                    else:
+                        templates.append(meta)
         except Exception as e:
             # Skip invalid or unauthorized directories
             continue
     return templates
+
+@app.post("/api/templates")
+def list_templates_post(req: TemplateFilterRequest):
+    """
+    Lists all ingested and ready-to-use mockup templates on disk.
+    Supports filtering by category in JSON request body.
+    """
+    return list_templates(category=req.category)
 
 @app.get("/api/templates/{template_id}")
 def get_template_by_id(template_id: str):
@@ -195,12 +210,36 @@ def render_mockup(req: RenderRequest):
             feather_radius=req.feather_radius,
             blend_mode=req.blend_mode,
             color_correct=req.color_correct,
-            transform_params=t_params
+            transform_params=t_params,
+            linear_blend=req.linear_blend
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Render pipeline failed: {str(e)}")
 
-    # Optional print DPI export resizing
+    # Collect rendering and validation warnings
+    warnings = []
+
+    # 1. Missing transparency on apparel templates warning
+    is_apparel = (
+        meta.get("category", "").lower() == "apparel" or
+        meta.get("subtype", "").lower() == "t-shirt"
+    )
+    if is_apparel and is_numpy_image_fully_opaque(design_img):
+        warnings.append("Missing transparency on apparel template: fully opaque design might look unrealistic on fabrics.")
+
+    # 2. Upscaling (smaller design size) warning
+    min_res = meta.get("min_upload_resolution_px", [400, 400])
+    if w_ds < min_res[0] or h_ds < min_res[1]:
+        warnings.append(f"Upscaling warning: Uploaded design size ({w_ds}x{h_ds}) is smaller than template's minimum recommended resolution ({min_res[0]}x{min_res[1]}).")
+    elif dst_corners is not None and len(dst_corners) == 4:
+        xs = [pt[0] for pt in dst_corners]
+        ys = [pt[1] for pt in dst_corners]
+        target_w = max(xs) - min(xs)
+        target_h = max(ys) - min(ys)
+        if w_ds < target_w or h_ds < target_h:
+            warnings.append(f"Upscaling warning: Uploaded design size ({w_ds}x{h_ds}) is smaller than target design zone ({int(target_w)}x{int(target_h)}). Visual quality may degrade.")
+
+    # Optional print DPI export resizing & output resolution clamping warning
     if req.physical_size_mm and len(req.physical_size_mm) == 2:
         export_w, export_h = calculate_export_dimensions(
             (req.physical_size_mm[0], req.physical_size_mm[1]),
@@ -208,9 +247,11 @@ def render_mockup(req: RenderRequest):
         )
         # Check max resolution bounds
         max_res = meta.get("export_max_resolution_px", [4000, 4000])
-        export_w = min(export_w, max_res[0])
-        export_h = min(export_h, max_res[1])
-        composite = cv2.resize(composite, (export_w, export_h), interpolation=cv2.INTER_CUBIC)
+        clamped_w = min(export_w, max_res[0])
+        clamped_h = min(export_h, max_res[1])
+        if clamped_w < export_w or clamped_h < export_h:
+            warnings.append(f"Output resolution was clamped to template's maximum limit of {max_res[0]}x{max_res[1]} pixels from requested {export_w}x{export_h} pixels.")
+        composite = cv2.resize(composite, (clamped_w, clamped_h), interpolation=cv2.INTER_CUBIC)
 
     h_out, w_out = composite.shape[:2]
 
@@ -250,7 +291,8 @@ def render_mockup(req: RenderRequest):
         mockup_base64=data_url,
         format=req.export_format,
         width=w_out,
-        height=h_out
+        height=h_out,
+        warnings=warnings
     )
 
 @app.get("/api/history")
@@ -263,6 +305,35 @@ def get_render_history():
     history = [dict(row) for row in rows]
     conn.close()
     return history
+
+def is_image_fully_opaque(img: Image.Image) -> bool:
+    """
+    Returns True if the image is fully opaque (i.e. has no transparent pixels).
+    Uses efficient Pillow properties and fallback to getextrema checks.
+    """
+    if img.mode not in ("RGBA", "LA", "PA", "P"):
+        return True
+    try:
+        rgba_img = img.convert("RGBA")
+        alpha = rgba_img.getchannel("A")
+        extrema = alpha.getextrema()
+        if extrema is not None:
+            # extrema is (min, max). If min is 255, every pixel has alpha=255.
+            return extrema[0] == 255
+    except Exception:
+        pass
+    return True
+
+def is_numpy_image_fully_opaque(img_np: np.ndarray) -> bool:
+    """
+    Returns True if the image is fully opaque (i.e. has no transparent pixels).
+    """
+    if len(img_np.shape) == 2 or img_np.shape[2] == 3:
+        return True
+    if img_np.shape[2] == 4:
+        alpha_channel = img_np[:, :, 3]
+        return np.all(alpha_channel == 255)
+    return True
 
 def sniff_and_sanitize_image(file_bytes: bytes) -> tuple:
     """
@@ -311,6 +382,9 @@ async def upload_design(file: UploadFile = File(...)):
 
     img, mime_type = sniff_and_sanitize_image(file_bytes)
 
+    # Determine if fully opaque to suggest background removal
+    prompt_bg_removal = is_image_fully_opaque(img)
+
     # Convert to RGBA to preserve transparency if it exists or if we save as PNG
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGBA")
@@ -335,7 +409,8 @@ async def upload_design(file: UploadFile = File(...)):
 
     return {
         "design_id": upload_id,
-        "preview": preview_url
+        "preview": preview_url,
+        "prompt_bg_removal": prompt_bg_removal
     }
 
 def validate_design_id(design_id: str) -> str:
