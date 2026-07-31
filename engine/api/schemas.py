@@ -20,6 +20,7 @@ class RenderRequest(BaseModel):
     export_format: Optional[str] = "png"
     dpi: Optional[int] = 300
     physical_size_mm: Optional[List[float]] = None
+    linear_blend: Optional[bool] = False
 
     @model_validator(mode="after")
     def check_design_provided(self) -> 'RenderRequest':
@@ -32,3 +33,7 @@ class RenderResponse(BaseModel):
     format: str
     width: int
     height: int
+    warnings: List[str] = []
+
+class TemplateFilterRequest(BaseModel):
+    category: Optional[str] = None
