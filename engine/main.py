@@ -168,6 +168,45 @@ def render_mockup(req: RenderRequest):
     h_ds, w_ds = design_img.shape[:2]
     src_corners = [[0, 0], [w_ds, 0], [w_ds, h_ds], [0, h_ds]]
 
+    # Warnings collection
+    warnings = []
+
+    # 1. Check for upscaling (design dimensions smaller than template recommended dimensions)
+    rec_res = meta.get("recommended_design_resolution_px", [1000, 1000])
+    if w_ds < rec_res[0] or h_ds < rec_res[1]:
+        warnings.append("upscaling")
+
+    # 2. Check for missing transparency on apparel templates (design is fully opaque)
+    if meta.get("category") == "apparel":
+        is_fully_opaque = True
+        if design_img.shape[2] == 4:
+            alpha_channel = design_img[:, :, 3]
+            min_val, _, _, _ = cv2.minMaxLoc(alpha_channel)
+            if min_val < 255:
+                is_fully_opaque = False
+        if is_fully_opaque:
+            warnings.append("missing_transparency")
+
+    # Optional print DPI export resizing
+    clamped = False
+    target_export_w, target_export_h = None, None
+    if req.physical_size_mm and len(req.physical_size_mm) == 2:
+        export_w, export_h = calculate_export_dimensions(
+            (req.physical_size_mm[0], req.physical_size_mm[1]),
+            req.dpi
+        )
+        # Check max resolution bounds
+        max_res = meta.get("export_max_resolution_px", [4000, 4000])
+        if export_w > max_res[0] or export_h > max_res[1]:
+            clamped = True
+            export_w = min(export_w, max_res[0])
+            export_h = min(export_h, max_res[1])
+        target_export_w, target_export_h = export_w, export_h
+
+    # 3. Check if resolution gets clamped
+    if clamped:
+        warnings.append("resolution_clamped")
+
     # Set default fold intensity if not custom supplied
     fold_intensity = req.fold_intensity if req.fold_intensity is not None else meta.get("fold_intensity", 15.0)
 
@@ -195,22 +234,14 @@ def render_mockup(req: RenderRequest):
             feather_radius=req.feather_radius,
             blend_mode=req.blend_mode,
             color_correct=req.color_correct,
-            transform_params=t_params
+            transform_params=t_params,
+            linear_blend=req.linear_blend or False
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Render pipeline failed: {str(e)}")
 
-    # Optional print DPI export resizing
-    if req.physical_size_mm and len(req.physical_size_mm) == 2:
-        export_w, export_h = calculate_export_dimensions(
-            (req.physical_size_mm[0], req.physical_size_mm[1]),
-            req.dpi
-        )
-        # Check max resolution bounds
-        max_res = meta.get("export_max_resolution_px", [4000, 4000])
-        export_w = min(export_w, max_res[0])
-        export_h = min(export_h, max_res[1])
-        composite = cv2.resize(composite, (export_w, export_h), interpolation=cv2.INTER_CUBIC)
+    if target_export_w is not None and target_export_h is not None:
+        composite = cv2.resize(composite, (target_export_w, target_export_h), interpolation=cv2.INTER_CUBIC)
 
     h_out, w_out = composite.shape[:2]
 
@@ -250,7 +281,8 @@ def render_mockup(req: RenderRequest):
         mockup_base64=data_url,
         format=req.export_format,
         width=w_out,
-        height=h_out
+        height=h_out,
+        warnings=warnings
     )
 
 @app.get("/api/history")
@@ -311,6 +343,19 @@ async def upload_design(file: UploadFile = File(...)):
 
     img, mime_type = sniff_and_sanitize_image(file_bytes)
 
+    # Check if the uploaded design is fully opaque to set prompt_bg_removal flag
+    prompt_bg_removal = True
+    if img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info):
+        alpha = img.getchannel("A") if "A" in img.getbands() else None
+        if alpha:
+            extrema = alpha.getextrema()
+            # If the minimum alpha value is less than 255, there is transparency
+            if extrema and extrema[0] < 255:
+                prompt_bg_removal = False
+        else:
+            if img.mode == "P" and "transparency" in img.info:
+                prompt_bg_removal = False
+
     # Convert to RGBA to preserve transparency if it exists or if we save as PNG
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGBA")
@@ -335,7 +380,8 @@ async def upload_design(file: UploadFile = File(...)):
 
     return {
         "design_id": upload_id,
-        "preview": preview_url
+        "preview": preview_url,
+        "prompt_bg_removal": prompt_bg_removal
     }
 
 def validate_design_id(design_id: str) -> str:
