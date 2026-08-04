@@ -17,6 +17,7 @@ class RenderRequest(BaseModel):
     color_correct: Optional[bool] = True
     feather_radius: Optional[int] = 5
     fold_intensity: Optional[float] = None  # Will default to template's setting if None
+    linear_blend: Optional[bool] = False
     export_format: Optional[str] = "png"
     dpi: Optional[int] = 300
     physical_size_mm: Optional[List[float]] = None
@@ -32,3 +33,4 @@ class RenderResponse(BaseModel):
     format: str
     width: int
     height: int
+    warnings: List[str] = []
