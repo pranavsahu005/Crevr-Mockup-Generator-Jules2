@@ -181,6 +181,51 @@ def render_mockup(req: RenderRequest):
             "offset_y": req.transform_params.offset_y
         }
 
+    # Determine potential warnings
+    warnings_list = []
+
+    # 1. Upscaling Warning: design image resolution smaller than recommended resolution or smaller than the destination zone in base image
+    # We can fetch the recommended resolution from template metadata
+    rec_res = meta.get("recommended_design_resolution_px", [1500, 1500])
+    if w_ds < rec_res[0] or h_ds < rec_res[1]:
+        warnings_list.append(
+            f"Upscaling warning: Your uploaded design dimensions ({w_ds}x{h_ds}) are smaller than the recommended resolution ({rec_res[0]}x{rec_res[1]}) for this template, which may result in pixelation."
+        )
+
+    # 2. Missing Transparency on Apparel Templates Warning
+    # Detect if apparel template AND design image is fully opaque
+    is_apparel = meta.get("category") == "apparel" or meta.get("subtype") == "t-shirt"
+    if is_apparel:
+        # Check transparency of design_img
+        is_fully_opaque = False
+        if len(design_img.shape) == 2:
+            is_fully_opaque = True
+        elif design_img.shape[2] == 3:
+            is_fully_opaque = True
+        else:
+            # 4-channel image
+            alpha_channel = design_img[:, :, 3]
+            min_alpha = np.min(alpha_channel)
+            if min_alpha == 255:
+                is_fully_opaque = True
+
+        if is_fully_opaque:
+            warnings_list.append(
+                "Apparel transparency warning: The uploaded design is fully opaque. For a more realistic blend, we highly recommend using a transparent PNG or using the Background Removal tool."
+            )
+
+    # 3. Output Resolution Clamping Warning
+    clamped_res = False
+    requested_w, requested_h = None, None
+    if req.physical_size_mm and len(req.physical_size_mm) == 2:
+        requested_w, requested_h = calculate_export_dimensions(
+            (req.physical_size_mm[0], req.physical_size_mm[1]),
+            req.dpi
+        )
+        max_res = meta.get("export_max_resolution_px", [4000, 4000])
+        if requested_w > max_res[0] or requested_h > max_res[1]:
+            clamped_res = True
+
     # Process through pipeline
     try:
         composite = render_mockup_pipeline(
@@ -195,7 +240,8 @@ def render_mockup(req: RenderRequest):
             feather_radius=req.feather_radius,
             blend_mode=req.blend_mode,
             color_correct=req.color_correct,
-            transform_params=t_params
+            transform_params=t_params,
+            linear_blend=req.linear_blend
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Render pipeline failed: {str(e)}")
@@ -210,6 +256,10 @@ def render_mockup(req: RenderRequest):
         max_res = meta.get("export_max_resolution_px", [4000, 4000])
         export_w = min(export_w, max_res[0])
         export_h = min(export_h, max_res[1])
+        if clamped_res:
+            warnings_list.append(
+                f"Output resolution clamping warning: The requested export resolution ({requested_w}x{requested_h}) exceeds the maximum allowed resolution ({max_res[0]}x{max_res[1]}) for this template and was clamped."
+            )
         composite = cv2.resize(composite, (export_w, export_h), interpolation=cv2.INTER_CUBIC)
 
     h_out, w_out = composite.shape[:2]
@@ -250,7 +300,8 @@ def render_mockup(req: RenderRequest):
         mockup_base64=data_url,
         format=req.export_format,
         width=w_out,
-        height=h_out
+        height=h_out,
+        warnings=warnings_list
     )
 
 @app.get("/api/history")
@@ -311,6 +362,20 @@ async def upload_design(file: UploadFile = File(...)):
 
     img, mime_type = sniff_and_sanitize_image(file_bytes)
 
+    # Determine if the uploaded image is fully opaque
+    prompt_bg_removal = False
+    if img.mode == "RGBA":
+        # Get the alpha channel
+        alpha = img.split()[-1]
+        # Get extrema: minimum and maximum pixel values in alpha channel
+        extrema = alpha.getextrema()
+        # If minimum alpha value is 255, it's fully opaque (no transparency)
+        if extrema[0] == 255:
+            prompt_bg_removal = True
+    elif img.mode == "RGB":
+        # RGB images have no alpha channel, hence fully opaque
+        prompt_bg_removal = True
+
     # Convert to RGBA to preserve transparency if it exists or if we save as PNG
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGBA")
@@ -335,7 +400,8 @@ async def upload_design(file: UploadFile = File(...)):
 
     return {
         "design_id": upload_id,
-        "preview": preview_url
+        "preview": preview_url,
+        "prompt_bg_removal": prompt_bg_removal
     }
 
 def validate_design_id(design_id: str) -> str:

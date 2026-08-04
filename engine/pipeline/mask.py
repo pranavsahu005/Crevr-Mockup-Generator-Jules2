@@ -36,13 +36,15 @@ def feather_mask_edges(mask: np.ndarray, feather_radius: int) -> np.ndarray:
 def blend_with_alpha_mask(
     foreground: np.ndarray,
     background: np.ndarray,
-    feathered_mask: np.ndarray
+    feathered_mask: np.ndarray,
+    linear_blend: bool = False
 ) -> np.ndarray:
     """
     Performs alpha blending of foreground over background using a feathered mask.
     foreground: BGRA or BGR image (uint8, same dimensions as background).
     background: BGR image.
     feathered_mask: 2D float32 mask of shape (H, W) with values [0, 1].
+    linear_blend: Perform alpha blending in linear light space (Gamma 2.2 approximation) rather than sRGB.
     Returns the composited BGR image (uint8).
     """
     # Ensure 3-channel format for foreground
@@ -60,7 +62,25 @@ def blend_with_alpha_mask(
     # Expand combined mask to 3 channels for broadcasting
     mask_3ch = np.stack([combined_mask] * 3, axis=2)
 
-    # Composite: FG * mask + BG * (1 - mask)
-    composited = fg_bgr * mask_3ch + bg_bgr * (1.0 - mask_3ch)
+    if linear_blend:
+        # Convert to 0.0 - 1.0 range
+        fg_norm = np.clip(fg_bgr / 255.0, 0.0, 1.0)
+        bg_norm = np.clip(bg_bgr / 255.0, 0.0, 1.0)
+
+        # Convert to linear light space (Gamma 2.2)
+        fg_linear = np.power(fg_norm, 2.2)
+        bg_linear = np.power(bg_norm, 2.2)
+
+        # Blend in linear space
+        blended_linear = fg_linear * mask_3ch + bg_linear * (1.0 - mask_3ch)
+
+        # Convert back to sRGB (Gamma 1 / 2.2)
+        blended_srgb = np.power(np.clip(blended_linear, 0.0, 1.0), 1.0 / 2.2)
+
+        # Scale back to 0-255
+        composited = blended_srgb * 255.0
+    else:
+        # Composite in standard gamma space: FG * mask + BG * (1 - mask)
+        composited = fg_bgr * mask_3ch + bg_bgr * (1.0 - mask_3ch)
 
     return np.clip(composited, 0.0, 255.0).astype(np.uint8)
