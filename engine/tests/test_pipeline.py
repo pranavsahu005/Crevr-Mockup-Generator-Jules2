@@ -74,3 +74,19 @@ def test_export_dimensions():
     # Test millimeter to pixel DPI conversion
     dims = calculate_export_dimensions((101.6, 152.4), 300) # 4x6 inches at 300 DPI
     assert dims == (1200, 1800)
+
+def test_linear_blend():
+    fg = np.ones((50, 50, 3), dtype=np.uint8) * 100
+    bg = np.ones((50, 50, 3), dtype=np.uint8) * 200
+    mask = np.ones((50, 50), dtype=np.float32) * 0.5
+
+    # Linear blend
+    blended_linear = blend_with_alpha_mask(fg, bg, mask, linear_blend=True)
+    assert blended_linear.shape == (50, 50, 3)
+
+    # SRGB blend
+    blended_srgb = blend_with_alpha_mask(fg, bg, mask, linear_blend=False)
+    assert blended_srgb.shape == (50, 50, 3)
+
+    # They should differ because linear blend converts to linear space before blending
+    assert not np.array_equal(blended_linear, blended_srgb)

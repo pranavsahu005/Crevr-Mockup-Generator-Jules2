@@ -143,3 +143,66 @@ def test_template_ingest_apparel():
 
     # Cleanup ingested template directory
     shutil.rmtree("templates/test_tshirt_ingested", ignore_errors=True)
+
+def test_upload_opaque_design():
+    # Fully opaque image should trigger prompt_bg_removal
+    img_bytes = create_dummy_image(100, 100, color=(255, 0, 0, 255)) # Fully opaque RGBA
+    response = client.post(
+        "/api/designs/upload",
+        files={"file": ("opaque.png", img_bytes, "image/png")}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["prompt_bg_removal"] is True
+
+    # Image with transparency should NOT trigger prompt_bg_removal
+    img_transparent = Image.new("RGBA", (100, 100), color=(255, 0, 0, 0)) # transparent
+    img_byte_arr = io.BytesIO()
+    img_transparent.save(img_byte_arr, format="PNG")
+    response_trans = client.post(
+        "/api/designs/upload",
+        files={"file": ("transparent.png", img_byte_arr.getvalue(), "image/png")}
+    )
+    assert response_trans.status_code == 200
+    assert response_trans.json()["prompt_bg_removal"] is False
+
+def test_render_warnings():
+    # Small fully opaque design (100x100) on t-shirt template (apparel)
+    img_bytes = create_dummy_image(100, 100, color=(255, 0, 0, 255))
+    upload_res = client.post(
+        "/api/designs/upload",
+        files={"file": ("opaque_small.png", img_bytes, "image/png")}
+    )
+    design_id = upload_res.json()["design_id"]
+
+    # Trigger render
+    render_payload = {
+        "template_id": "tshirt_01",
+        "design_id": design_id,
+        "blend_mode": "multiply",
+        "color_correct": False,
+        "feather_radius": 3
+    }
+    render_res = client.post("/api/render", json=render_payload)
+    assert render_res.status_code == 200
+    data = render_res.json()
+    warnings = data["warnings"]
+
+    # Assert upscaling warning and missing transparency warning are present
+    assert any("resolution" in w and "lower than recommended" in w for w in warnings)
+    assert any("transparency" in w and "apparel" in w for w in warnings)
+
+    # Trigger render with DPI rescaling that gets clamped
+    render_payload_clamp = {
+        "template_id": "tshirt_01",
+        "design_id": design_id,
+        "blend_mode": "multiply",
+        "color_correct": False,
+        "feather_radius": 3,
+        "dpi": 600,
+        "physical_size_mm": [200, 200]  # large size causing output to be clamped
+    }
+    render_res_clamp = client.post("/api/render", json=render_payload_clamp)
+    assert render_res_clamp.status_code == 200
+    warnings_clamp = render_res_clamp.json()["warnings"]
+    assert any("clamped" in w for w in warnings_clamp)
