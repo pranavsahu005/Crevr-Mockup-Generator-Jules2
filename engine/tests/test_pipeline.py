@@ -52,6 +52,19 @@ def test_mask_feathering():
     assert feathered.dtype == np.float32
     assert np.max(feathered) <= 1.0
 
+def test_linear_blend_compositing():
+    foreground = np.ones((50, 50, 4), dtype=np.uint8) * 200
+    background = np.ones((50, 50, 3), dtype=np.uint8) * 100
+    mask = np.ones((50, 50), dtype=np.float32) * 0.5 # half transparency
+
+    composited_normal = blend_with_alpha_mask(foreground, background, mask, linear_blend=False)
+    composited_linear = blend_with_alpha_mask(foreground, background, mask, linear_blend=True)
+
+    assert composited_normal.shape == (50, 50, 3)
+    assert composited_linear.shape == (50, 50, 3)
+    # The mathematical value of blending in linear space vs gamma space should be slightly different
+    assert not np.array_equal(composited_normal, composited_linear)
+
 def test_end_to_end_pipeline():
     # Create simple mock base, design, and mask images
     base = np.zeros((100, 100, 3), dtype=np.uint8)

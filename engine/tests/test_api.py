@@ -22,7 +22,10 @@ def setup_and_teardown():
             os.remove(filepath)
 
 def create_dummy_image(w=100, h=100, format="PNG", color=(255, 0, 0, 255)):
-    img = Image.new("RGBA", (w, h), color=color)
+    mode = "RGB" if format in ("JPEG", "JPG") else "RGBA"
+    if mode == "RGB" and len(color) == 4:
+        color = color[:3]
+    img = Image.new(mode, (w, h), color=color)
     img_byte_arr = io.BytesIO()
     img.save(img_byte_arr, format=format)
     return img_byte_arr.getvalue()
@@ -143,3 +146,53 @@ def test_template_ingest_apparel():
 
     # Cleanup ingested template directory
     shutil.rmtree("templates/test_tshirt_ingested", ignore_errors=True)
+
+def test_upload_design_prompt_bg_removal():
+    # Fully opaque image -> prompt_bg_removal should be True
+    img_bytes_opaque = create_dummy_image(100, 100, format="JPEG") # JPEG doesn't support alpha, always opaque
+    response = client.post(
+        "/api/designs/upload",
+        files={"file": ("test_opaque.jpg", img_bytes_opaque, "image/jpeg")}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["prompt_bg_removal"] is True
+
+    # Image with transparency -> prompt_bg_removal should be False
+    img_bytes_transparent = create_dummy_image(100, 100, format="PNG", color=(255, 0, 0, 0)) # fully transparent
+    response = client.post(
+        "/api/designs/upload",
+        files={"file": ("test_trans.png", img_bytes_transparent, "image/png")}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["prompt_bg_removal"] is False
+
+def test_render_warnings():
+    # Upload an opaque design
+    img_bytes = create_dummy_image(100, 100, color=(255, 0, 0, 255)) # fully opaque
+    upload_res = client.post(
+        "/api/designs/upload",
+        files={"file": ("opaque_design.png", img_bytes, "image/png")}
+    )
+    design_id = upload_res.json()["design_id"]
+
+    # Trigger render using template 'tshirt_01' which is an apparel template
+    # Design size (100x100) is smaller than recommended (1200x1200) -> should trigger upscaling warning
+    # Design is fully opaque and category is apparel -> should trigger apparel transparency warning
+    render_payload = {
+        "template_id": "tshirt_01",
+        "design_id": design_id,
+        "blend_mode": "multiply",
+        "color_correct": False,
+        "feather_radius": 3
+    }
+    render_res = client.post("/api/render", json=render_payload)
+    assert render_res.status_code == 200
+    data = render_res.json()
+    assert "warnings" in data
+    assert len(data["warnings"]) > 0
+    # Check that both warnings are returned
+    warnings_text = " ".join(data["warnings"])
+    assert "resolution" in warnings_text or "recommended" in warnings_text
+    assert "transparency" in warnings_text or "apparel" in warnings_text
