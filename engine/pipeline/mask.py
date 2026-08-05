@@ -36,13 +36,15 @@ def feather_mask_edges(mask: np.ndarray, feather_radius: int) -> np.ndarray:
 def blend_with_alpha_mask(
     foreground: np.ndarray,
     background: np.ndarray,
-    feathered_mask: np.ndarray
+    feathered_mask: np.ndarray,
+    linear_blend: bool = False
 ) -> np.ndarray:
     """
     Performs alpha blending of foreground over background using a feathered mask.
     foreground: BGRA or BGR image (uint8, same dimensions as background).
     background: BGR image.
     feathered_mask: 2D float32 mask of shape (H, W) with values [0, 1].
+    linear_blend: perform blending in linear light space (Gamma 2.2 approximation).
     Returns the composited BGR image (uint8).
     """
     # Ensure 3-channel format for foreground
@@ -61,6 +63,12 @@ def blend_with_alpha_mask(
     mask_3ch = np.stack([combined_mask] * 3, axis=2)
 
     # Composite: FG * mask + BG * (1 - mask)
-    composited = fg_bgr * mask_3ch + bg_bgr * (1.0 - mask_3ch)
+    if linear_blend:
+        fg_linear = (fg_bgr / 255.0) ** 2.2
+        bg_linear = (bg_bgr / 255.0) ** 2.2
+        composited_linear = fg_linear * mask_3ch + bg_linear * (1.0 - mask_3ch)
+        composited = np.clip(composited_linear, 0.0, 1.0) ** (1.0 / 2.2) * 255.0
+    else:
+        composited = fg_bgr * mask_3ch + bg_bgr * (1.0 - mask_3ch)
 
     return np.clip(composited, 0.0, 255.0).astype(np.uint8)
