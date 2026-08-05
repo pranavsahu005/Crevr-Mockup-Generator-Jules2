@@ -181,6 +181,27 @@ def render_mockup(req: RenderRequest):
             "offset_y": req.transform_params.offset_y
         }
 
+    warnings = []
+
+    # Check for upscaling warning
+    rec_res = meta.get("recommended_design_resolution_px")
+    if rec_res and (h_ds < rec_res[1] or w_ds < rec_res[0]):
+        warnings.append("Design resolution is lower than recommended; upscaling may reduce quality.")
+
+    # Check for missing transparency on apparel templates
+    is_opaque = False
+    if len(design_img.shape) == 2:
+        is_opaque = True
+    elif design_img.shape[2] == 3:
+        is_opaque = True
+    elif design_img.shape[2] == 4:
+        alpha_channel = design_img[:, :, 3]
+        if np.all(alpha_channel == 255):
+            is_opaque = True
+
+    if meta.get("category") == "apparel" and is_opaque:
+        warnings.append("The uploaded design is opaque. For apparel templates, transparent designs are recommended to avoid solid backgrounds.")
+
     # Process through pipeline
     try:
         composite = render_mockup_pipeline(
@@ -195,7 +216,8 @@ def render_mockup(req: RenderRequest):
             feather_radius=req.feather_radius,
             blend_mode=req.blend_mode,
             color_correct=req.color_correct,
-            transform_params=t_params
+            transform_params=t_params,
+            linear_blend=req.linear_blend
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Render pipeline failed: {str(e)}")
@@ -208,6 +230,8 @@ def render_mockup(req: RenderRequest):
         )
         # Check max resolution bounds
         max_res = meta.get("export_max_resolution_px", [4000, 4000])
+        if export_w > max_res[0] or export_h > max_res[1]:
+            warnings.append(f"Requested export dimensions ({export_w}x{export_h} px) exceed the template's maximum limit of {max_res[0]}x{max_res[1]} px and have been clamped.")
         export_w = min(export_w, max_res[0])
         export_h = min(export_h, max_res[1])
         composite = cv2.resize(composite, (export_w, export_h), interpolation=cv2.INTER_CUBIC)
@@ -250,7 +274,8 @@ def render_mockup(req: RenderRequest):
         mockup_base64=data_url,
         format=req.export_format,
         width=w_out,
-        height=h_out
+        height=h_out,
+        warnings=warnings
     )
 
 @app.get("/api/history")
@@ -311,6 +336,17 @@ async def upload_design(file: UploadFile = File(...)):
 
     img, mime_type = sniff_and_sanitize_image(file_bytes)
 
+    # Determine if fully opaque (to recommend background removal if appropriate)
+    prompt_bg_removal = True
+    if img.mode == "RGBA":
+        alpha = np.array(img.getchannel("A"))
+        if np.any(alpha < 255):
+            prompt_bg_removal = False
+    elif img.mode == "LA":
+        alpha = np.array(img.getchannel("A"))
+        if np.any(alpha < 255):
+            prompt_bg_removal = False
+
     # Convert to RGBA to preserve transparency if it exists or if we save as PNG
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGBA")
@@ -335,7 +371,8 @@ async def upload_design(file: UploadFile = File(...)):
 
     return {
         "design_id": upload_id,
-        "preview": preview_url
+        "preview": preview_url,
+        "prompt_bg_removal": prompt_bg_removal
     }
 
 def validate_design_id(design_id: str) -> str:

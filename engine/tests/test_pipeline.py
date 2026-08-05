@@ -74,3 +74,24 @@ def test_export_dimensions():
     # Test millimeter to pixel DPI conversion
     dims = calculate_export_dimensions((101.6, 152.4), 300) # 4x6 inches at 300 DPI
     assert dims == (1200, 1800)
+
+def test_linear_blend_compositing():
+    # Verify that linear blending differs from standard sRGB blending (due to non-linear gamma 2.2 mapping)
+    foreground = np.zeros((10, 10, 4), dtype=np.uint8)
+    foreground[:, :, :3] = 128
+    foreground[:, :, 3] = 255 # opaque
+
+    background = np.zeros((10, 10, 3), dtype=np.uint8)
+    background[:, :, :3] = 255 # white
+
+    mask = np.ones((10, 10), dtype=np.float32) * 0.5 # half alpha feathered mask
+
+    # 1. Standard sRGB Blend
+    srgb_blend = blend_with_alpha_mask(foreground, background, mask, linear_blend=False)
+    # Expected: 128 * 0.5 + 255 * 0.5 = 64 + 127 = 191
+    assert 190 <= srgb_blend[0, 0, 0] <= 192
+
+    # 2. Linear Light Blend (Gamma 2.2 approximation)
+    linear_blend_out = blend_with_alpha_mask(foreground, background, mask, linear_blend=True)
+    # Due to gamma compression/expansion, the results should be slightly different (not exactly 191)
+    assert srgb_blend[0, 0, 0] != linear_blend_out[0, 0, 0]
