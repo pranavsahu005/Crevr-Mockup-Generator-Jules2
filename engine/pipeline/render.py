@@ -17,7 +17,8 @@ def render_mockup_pipeline(
     feather_radius: int = 5,
     blend_mode: str = "multiply",
     color_correct: bool = True,
-    transform_params: dict = None
+    transform_params: dict = None,
+    linear_blend: bool = False
 ) -> np.ndarray:
     """
     Orchestrates the entire mockup render pipeline.
@@ -98,7 +99,7 @@ def render_mockup_pipeline(
     feathered_mask = feather_mask_edges(cleaned_mask, feather_radius)
 
     # 6. Final compositing of the warped design over base image
-    final_composite = blend_with_alpha_mask(warped_design, base_image, feathered_mask)
+    final_composite = blend_with_alpha_mask(warped_design, base_image, feathered_mask, linear_blend=linear_blend)
 
     return final_composite
 

@@ -83,6 +83,58 @@ def test_remove_background():
     traversal_res = client.post("/api/designs/../remove-bg")
     assert traversal_res.status_code == 404 # route not matching or invalid
 
+def test_upload_suggest_bg_removal():
+    # 1. Upload an opaque design (returns prompt_bg_removal = True)
+    img_bytes_opaque = create_dummy_image(100, 100, color=(255, 0, 0, 255))
+    res_opaque = client.post(
+        "/api/designs/upload",
+        files={"file": ("opaque.png", img_bytes_opaque, "image/png")}
+    )
+    assert res_opaque.status_code == 200
+    assert res_opaque.json()["prompt_bg_removal"] is True
+
+    # 2. Upload a transparent design (returns prompt_bg_removal = False)
+    img_bytes_transparent = create_dummy_image(100, 100, color=(255, 0, 0, 0)) # fully transparent
+    res_trans = client.post(
+        "/api/designs/upload",
+        files={"file": ("transparent.png", img_bytes_transparent, "image/png")}
+    )
+    assert res_trans.status_code == 200
+    assert res_trans.json()["prompt_bg_removal"] is False
+
+def test_render_warnings():
+    # Upload a small opaque design to trigger multiple warnings on apparel template
+    img_bytes_opaque = create_dummy_image(50, 50, color=(0, 255, 0, 255)) # small and opaque
+    upload_res = client.post(
+        "/api/designs/upload",
+        files={"file": ("small_opaque.png", img_bytes_opaque, "image/png")}
+    )
+    design_id = upload_res.json()["design_id"]
+
+    # Trigger render on 'tshirt_01' which expects larger transparent design
+    render_payload = {
+        "template_id": "tshirt_01",
+        "design_id": design_id,
+        "blend_mode": "multiply",
+        "color_correct": False,
+        "feather_radius": 3,
+        "linear_blend": True,
+        "physical_size_mm": [1000.0, 1000.0], # massive physical size to trigger resolution clamping
+        "dpi": 600
+    }
+    render_res = client.post("/api/render", json=render_payload)
+    assert render_res.status_code == 200
+    data = render_res.json()
+    assert "warnings" in data
+    warnings = data["warnings"]
+    assert len(warnings) > 0
+    # Should warning about upscaling/resolution
+    assert any("resolution" in w or "upscaling" in w for w in warnings)
+    # Should warn about opaque design on apparel
+    assert any("opaque" in w or "transparency" in w for w in warnings)
+    # Should warn about clamping
+    assert any("clamp" in w or "exceed" in w for w in warnings)
+
 def test_render_using_uploaded_id():
     # Upload design first
     img_bytes = create_dummy_image(100, 100, color=(0, 255, 0, 255))
